@@ -681,11 +681,20 @@ function App() {
     localStorage.setItem("oilapp_theme", name);
   }
 
-  const [settings, setSettings] = useState(() => {
+ const [settings, setSettings] = useState(() => {
     try {
       const st = localStorage.getItem("oilapp_settings");
-      return st ? JSON.parse(st) : { sheetUrl: "", webhookUrl: "" };
-    } catch { return { sheetUrl: "", webhookUrl: "" }; }
+      const parsed = st ? JSON.parse(st) : {};
+      return {
+        sheetUrl: parsed.sheetUrl || "https://docs.google.com/spreadsheets/d/1ULHg8o57KTZVbMsHGz7cDcyh89-B9zreI1-q6WsmLFg/edit?usp=sharing",
+        webhookUrl: parsed.webhookUrl || "https://script.google.com/macros/s/AKfycbxsza5HUKosnOtEwFaMESMPXKNLW2pAOLn7usKFmXC6crZtEcWL5rraoI6sWUERxqYv/exec"
+      };
+    } catch { 
+      return { 
+        sheetUrl: "https://docs.google.com/spreadsheets/d/1ULHg8o57KTZVbMsHGz7cDcyh89-B9zreI1-q6WsmLFg/edit?usp=sharing", 
+        webhookUrl: "https://script.google.com/macros/s/AKfycbxsza5HUKosnOtEwFaMESMPXKNLW2pAOLn7usKFmXC6crZtEcWL5rraoI6sWUERxqYv/exec" 
+      }; 
+    }
   });
 
   function saveSettings(st) {
