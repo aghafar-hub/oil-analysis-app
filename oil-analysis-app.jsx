@@ -1,0 +1,4180 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+
+const NAV_ITEMS_DEF = [
+  { id: "dashboard",  label: "Dashboard",          icon: "ti-layout-dashboard" },
+  { id: "equipment",  label: "Equipment",           icon: "ti-engine" },
+  { id: "oilreport",  label: "Oil Analysis Report", icon: "ti-file-analytics" },
+  { id: "upload",     label: "Add Sample",          icon: "ti-plus" },
+  { id: "actions",    label: "Action Tracker",      icon: "ti-checklist" },
+  { id: "oilchange",  label: "Oil Change Log",      icon: "ti-oil" },
+  { id: "tracker",    label: "Sample Tracker",      icon: "ti-timeline" },
+  { id: "settings",   label: "Settings",            icon: "ti-settings" },
+];
+
+// ─── Global date formatter ────────────────────────────────────────────────────
+// Converts ANY date value from sheet (ISO string, serial number, plain string)
+// to "26 Dec 2025" display format. Safe — returns "—" for nulls/invalid.
+function fmtDate(val) {
+  if (!val && val !== 0) return "—";
+  // Google Sheets serial number (days since 30 Dec 1899)
+  if (typeof val === "number") {
+    const d = new Date(Math.round((val - 25569) * 86400 * 1000));
+    return d.toLocaleDateString("en-GB", { day:"numeric", month:"short", year:"numeric" });
+  }
+  const s = String(val).trim();
+  if (!s || s === "—") return "—";
+  // Already formatted like "26 Dec 2025" — keep it
+  if (/^\d{1,2} [A-Za-z]+ \d{4}$/.test(s)) return s;
+  // ISO / date-time string
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return s; // unrecognised — return as-is
+  return d.toLocaleDateString("en-GB", { day:"numeric", month:"short", year:"numeric" });
+}
+
+
+// ─── Apps Script helpers ───────────────────────────────────────────────────────
+// Single URL handles both GET (read) and POST (write).
+// GET  ?action=readAll         → returns { samples, actions, oilChanges, trackerRows }
+// POST { action, sheet, row }  → appends row or updates tracker
+
+// ─── Apps Script communication ────────────────────────────────────────────────
+// Strategy: try fetch() first (works when hosted on Google Drive /
+// googleusercontent.com since that domain is on Google's allowlist).
+// If fetch fails with CORS / network error, fall back to JSONP <script> tag
+// which bypasses CORS entirely and works from any domain.
+
+function sheetRead(webhookUrl) {
+  return new Promise(async (resolve, reject) => {
+    if (!webhookUrl) { reject(new Error("No webhook URL")); return; }
+
+    // ── Try fetch first ──────────────────────────────────────────
+    try {
+      const res = await fetch(
+        `${webhookUrl}?action=readAll&t=${Date.now()}`,
+        { method: "GET" }
+      );
+      if (res.ok) {
+        const text = await res.text();
+        // If we got HTML (login page), fall through to JSONP
+        if (!text.startsWith("<")) {
+          try { resolve(JSON.parse(text)); return; } catch {}
+        }
+      }
+    } catch (_) {
+      // fetch blocked by CORS — fall through to JSONP
+    }
+
+    // ── JSONP fallback ───────────────────────────────────────────
+    const cbName = "__gasCallback_" + Date.now();
+    const script  = document.createElement("script");
+    const timer   = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timeout (20s) — script not deployed as 'Anyone', or URL is wrong"));
+    }, 20000);
+
+    function cleanup() {
+      clearTimeout(timer);
+      delete window[cbName];
+      if (script.parentNode) script.parentNode.removeChild(script);
+    }
+
+    window[cbName] = (data) => { cleanup(); resolve(data); };
+
+    script.src = `${webhookUrl}?action=readAll&callback=${cbName}&t=${Date.now()}`;
+    script.onerror = () => {
+      cleanup();
+      reject(new Error("Script load failed — URL wrong or access restricted"));
+    };
+    document.head.appendChild(script);
+  });
+}
+
+async function sheetWrite(webhookUrl, payload) {
+  if (!webhookUrl) return;
+  try {
+    await fetch(webhookUrl, {
+      method: "POST",
+      mode: "no-cors",
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.warn("sheetWrite error:", e);
+  }
+}
+
+// Update an existing row in a sheet, matched by column indices/values
+function sheetUpdateRow(webhookUrl, sheet, matchCols, matchValues, row) {
+  return sheetWrite(webhookUrl, { action: "updateRow", sheet, matchCols, matchValues, row });
+}
+
+// Delete an existing row from a sheet, matched by column indices/values
+function sheetDeleteRow(webhookUrl, sheet, matchCols, matchValues) {
+  return sheetWrite(webhookUrl, { action: "deleteRow", sheet, matchCols, matchValues });
+}
+
+// ─── Row ↔ Object mappers ─────────────────────────────────────────────────────
+const DATA_ENTRY_HEADERS = [
+  "Equipment Code","Description","Sample ID","Sample Date","Report Status",
+  "Contamination Rating","Equipment Rating","Lubricant Rating",
+  "Particle Count >4um","Particle Count >6um","Particle Count >14um","PQ Index",
+  "Visc@40C (cSt)","TAN (mg KOH/g)","Oxidation (Ab/cm)","Water (Vol%)",
+  "Ag","Al","Cr","Cu","Fe","Mo","Ni","Pb","Sn",
+  "K","Na","Si","B","Ba","Ca","Mg","P","Zn",
+  "Alert Type","Sample Analysis"
+];
+
+function rowToSample(row) {
+  // row is an array matching DATA_ENTRY_HEADERS order
+  const [
+    unitId, description, sampleId, sampledDate, reportStatus,
+    contaminationRating, equipmentRating, lubricantRating,
+    pc4, pc6, pc14, pqIndex,
+    visc40C, tan, oxidation, water,
+    Ag, Al, Cr, Cu, Fe, Mo, Ni, Pb, Sn,
+    K, Na, Si, B, Ba, Ca, Mg, P, Zn,
+    alertType, sampleAnalysis
+  ] = row;
+  return {
+    unitId, description, sampleId,
+    sampledDate: fmtDate(sampledDate),
+    reportedDate: fmtDate(row[86]),   // not in standard 36-col row, just guard
+    reportStatus,
+    contaminationRating, equipmentRating, lubricantRating,
+    particleCount4um: pc4, particleCount6um: pc6, particleCount14um: pc14, pqIndex,
+    visc40C, tan, oxidation, water,
+    wear: { Ag, Al, Cr, Cu, Fe, Mo, Ni, Pb, Sn },
+    contaminants: { K, Na, Si },
+    additives: { B, Ba, Ca, Mg, P, Zn },
+    recommendations: sampleAnalysis ? [sampleAnalysis] : [],
+    _id: `${unitId}_${sampleId}_${sampledDate}`,
+    _matchCols: [0, 2],            // Equipment Code, Sample ID
+    _matchValues: [unitId, sampleId],
+  };
+}
+
+function sampleToRow(s) {
+  return [
+    s.unitId, s.description, s.sampleId, s.sampledDate,
+    s.reportStatus, s.contaminationRating, s.equipmentRating, s.lubricantRating,
+    s.particleCount4um||"", s.particleCount6um||"", s.particleCount14um||"", s.pqIndex||"",
+    s.visc40C||"", s.tan||"", s.oxidation||"", s.water||"",
+    s.wear?.Ag||"", s.wear?.Al||"", s.wear?.Cr||"", s.wear?.Cu||"", s.wear?.Fe||"",
+    s.wear?.Mo||"", s.wear?.Ni||"", s.wear?.Pb||"", s.wear?.Sn||"",
+    s.contaminants?.K||"", s.contaminants?.Na||"", s.contaminants?.Si||"",
+    s.additives?.B||"", s.additives?.Ba||"", s.additives?.Ca||"",
+    s.additives?.Mg||"", s.additives?.P||"", s.additives?.Zn||"",
+    s.recommendations?.join("; ")||"", s.recommendations?.join("; ")||""
+  ];
+}
+
+const ACTION_TRACKER_HEADERS = [
+  "Ac. No.","Equipment Code","Description","Oil Type","Revision Date",
+  "Sample Date","Sample Result","Sample Analysis","Last Change","Status",
+  "Contractor Action","Contractor","Completed Date",
+  "Prev. Month Agreed Action","ACC Action","Agreed Action"
+];
+
+function rowToAction(row) {
+  const [acNo,equipmentCode,description,oilType,revisionDate,
+    sampleDate,sampleResult,sampleAnalysis,lastChange,status,
+    contractorAction,contractor,completedDate,
+    prevMonthAgreedAction,accAction,agreedAction] = row;
+  return { acNo,equipmentCode,description,oilType,revisionDate:fmtDate(revisionDate),
+    sampleDate:fmtDate(sampleDate),sampleResult,sampleAnalysis,lastChange:fmtDate(lastChange),status,
+    contractorAction,contractor,completedDate:fmtDate(completedDate),
+    prevMonthAgreedAction,accAction,agreedAction,
+    unitId: equipmentCode,
+    _id: `${equipmentCode}_${sampleDate}_${acNo}_${revisionDate}`,
+    _matchCols: [0, 1],             // Ac.No, Equipment Code
+    _matchValues: [acNo, equipmentCode] };
+}
+
+function actionToRow(a) {
+  return [
+    a.acNo||"", a.equipmentCode||a.unitId||"", a.description||"", a.oilType||"",
+    a.revisionDate||"", a.sampleDate||"", a.sampleResult||"", a.sampleAnalysis||"",
+    a.lastChange||"", a.status||"", a.contractorAction||"", a.contractor||"",
+    a.completedDate||"", a.prevMonthAgreedAction||"", a.accAction||"", a.agreedAction||""
+  ];
+}
+
+// Sheet columns A-L (12 cols). App reads/writes A,C,D,E,F,G,J,K,L:
+//  A=Asset, B=(unused), C=Lubrication Points, D=Frequency, E=Oil Type,
+//  F=Brand, G=Qty(ltr), H=(prev change date 1), I=(prev change date 2),
+//  J=Last change, K=Next Oil Change, L=Status
+const OIL_CHANGE_HEADERS = [
+  "Asset","","Lubrication Points","Frequency","Oil Type","Brand","Qty (ltr.)","","","Last change","Next Oil Change","Status"
+];
+
+function rowToOilChange(row) {
+  const asset = row[0], lubricationPoint = row[2], frequency = row[3],
+    oilType = row[4], brand = row[5], quantity = row[6],
+    lastChange = row[9], nextOilChange = row[10], status = row[11];
+  return {
+    equipmentCode: asset, assetName: asset,
+    lubricationPoint, frequency, oilType, brand, quantity,
+    changeDate: fmtDate(lastChange), nextDueDate: fmtDate(nextOilChange),
+    status: (status || "").toString().trim() || "Current",
+    _id: `${asset}_${lubricationPoint}_${oilType}`,
+    _matchCols: [0, 2, 4],          // Asset, Lubrication Points, Oil Type
+    _matchValues: [asset, lubricationPoint, oilType],
+    _rawRow: row,
+  };
+}
+
+function oilChangeToRow(c) {
+  // 12-col row matching sheet columns A-L
+  return [
+    c.equipmentCode||c.assetName||"",  // A: Asset
+    "",                                  // B: (unused)
+    c.lubricationPoint||"",             // C: Lubrication Points
+    c.frequency||"Oil Analysis",        // D: Frequency
+    c.oilType||"",                      // E: Oil Type
+    c.brand||"",                        // F: Brand
+    c.quantity||"",                     // G: Qty (ltr.)
+    "",                                  // H: (unused)
+    "",                                  // I: (unused)
+    c.changeDate||"",                   // J: Last change
+    c.nextDueDate||"",                  // K: Next Oil Change
+    c.status||"Current"                 // L: Status
+  ];
+}
+
+// Merge two arrays by _id, preferring local (more recent) entries
+function mergeById(sheetArr, localArr) {
+  const map = new Map();
+  sheetArr.forEach(x => map.set(x._id, x));
+  localArr.forEach(x => map.set(x._id, x)); // local wins on conflict
+  return Array.from(map.values());
+}
+
+// Generate the next sequential Action Number based on existing actions
+function nextAcNo(actions) {
+  let max = 0;
+  (actions||[]).forEach(a => {
+    const n = parseInt(String(a.acNo||"").replace(/\D/g,""), 10);
+    if (!isNaN(n) && n > max) max = n;
+  });
+  return String(max + 1);
+}
+
+// ─── Equipment Select — searchable combo (search + dropdown combined) ─────────
+function EquipmentSelect({ value, onChange, placeholder, allowAll, width }) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+
+  const options = allowAll ? [{ code:"All", description:"All Equipment" }, ...EQUIPMENT_REGISTRY] : EQUIPMENT_REGISTRY;
+  const filtered = options.filter(e => {
+    if (!search) return true;
+    const q = search.toLowerCase();
+    return e.code.toLowerCase().includes(q) || (e.description||"").toLowerCase().includes(q);
+  });
+
+  const selected = options.find(e => e.code === value);
+  const displayValue = open ? search : (selected ? `${selected.code}${selected.description && selected.code!=="All" ? " — "+selected.description : ""}` : "");
+
+  return (
+    <div style={{ position:"relative", width: width||220, flexShrink:0 }}>
+      <div style={{ position:"relative" }}>
+        <i className="ti ti-search" style={{ position:"absolute", left:8, top:"50%", transform:"translateY(-50%)", color:S.T.textMuted, fontSize:13, pointerEvents:"none" }} aria-hidden/>
+        <input
+          style={{ ...S.input, paddingLeft:26, fontSize:12, cursor:"pointer" }}
+          value={displayValue}
+          placeholder={placeholder || "Select equipment..."}
+          onFocus={() => { setOpen(true); setSearch(""); }}
+          onChange={e => { setSearch(e.target.value); setOpen(true); }}
+          onBlur={() => setTimeout(() => setOpen(false), 150)}
+        />
+        {value && value!=="All" && !open && (
+          <button type="button" onMouseDown={e=>{e.preventDefault(); onChange("");}}
+            style={{ position:"absolute", right:6, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", color:S.T.textMuted, cursor:"pointer", fontSize:14 }}>×</button>
+        )}
+      </div>
+      {open && (
+        <div style={{ position:"absolute", zIndex:99, top:"100%", left:0, right:0, background:S.T.cardBg,
+          border:`1px solid ${S.T.border}`, borderRadius:8, marginTop:4, maxHeight:240, overflowY:"auto",
+          boxShadow:`0 4px 16px ${S.T.appBg}aa` }}>
+          {filtered.length === 0 && <div style={{ padding:"10px 12px", color:S.T.textMuted, fontSize:12 }}>No matches</div>}
+          {filtered.map(e => (
+            <div key={e.code}
+              onMouseDown={() => { onChange(e.code); setSearch(""); setOpen(false); }}
+              style={{ padding:"7px 12px", cursor:"pointer", fontSize:12,
+                background: value===e.code ? S.T.navActive : "transparent",
+                borderBottom:`1px solid ${S.T.border2}` }}
+              onMouseEnter={ev=>ev.currentTarget.style.background=S.T.infoBarBg}
+              onMouseLeave={ev=>ev.currentTarget.style.background=value===e.code?S.T.navActive:"transparent"}>
+              <span style={{ fontWeight:600, color: e.code==="All"?S.T.textPrimary:S.T.accent }}>{e.code}</span>
+              {e.description && e.code!=="All" && <span style={{ color:S.T.textSecondary }}> — {e.description}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Diagnostics Panel ────────────────────────────────────────────────────────
+function DiagnosticsPanel({ webhookUrl, syncMsg, onSync }) {
+  const [log, setLog] = useState([]);
+  const [running, setRunning] = useState(false);
+
+  function addLog(msg, color) {
+    setLog(prev => [...prev, { msg, color, t: new Date().toLocaleTimeString() }]);
+  }
+
+  async function runDiag() {
+    setLog([]);
+    setRunning(true);
+
+    if (!webhookUrl) {
+      addLog("✗ No webhook URL configured — paste it in the field above", "danger");
+      setRunning(false);
+      return;
+    }
+
+    addLog(`URL: ${webhookUrl.slice(0,70)}…`, "info");
+    addLog("Using JSONP (script tag) — the only method that works cross-origin to Apps Script", "muted");
+
+    let data;
+    try {
+      addLog("Injecting <script> tag…", "info");
+      data = await sheetRead(webhookUrl);
+      addLog("✓ Got response from Apps Script", "success");
+    } catch (e) {
+      addLog(`✗ ${e.message}`, "danger");
+      if (e.message.includes("Timeout")) {
+        addLog("→ Script is too slow, or 'Who has access' is not set to 'Anyone'", "warning");
+      } else if (e.message.includes("Script load failed")) {
+        addLog("→ URL is wrong, or script not deployed, or access restricted", "warning");
+      }
+      addLog("Fix: Apps Script → Deploy → Manage deployments → edit → Who has access: Anyone → new version → Deploy", "warning");
+      setRunning(false);
+      return;
+    }
+
+    if (data.error) {
+      addLog(`✗ Script returned error: ${data.error}`, "danger");
+      setRunning(false);
+      return;
+    }
+
+    // Inspect each sheet
+    ["samples","actions","oilChanges","tracker"].forEach(k => {
+      const arr = data[k];
+      if (!arr) {
+        addLog(`✗ "${k}" key missing — update Apps Script code from Settings`, "danger");
+      } else {
+        addLog(`✓ "${k}": ${arr.length} rows returned`, arr.length > 0 ? "success" : "warning");
+        if (arr.length > 0) {
+          addLog(`  First row: ${JSON.stringify(arr[0]).slice(0,180)}`, "muted");
+        } else {
+          addLog(`  → Tab may be empty or named differently in your sheet`, "warning");
+        }
+      }
+    });
+
+    addLog("Expected tab names: 'Data_Entry' · 'Action Tracker' · 'Oil Change Log' · 'Oil Sample Tracker'", "info");
+
+    try {
+      const last = sessionStorage.getItem("lastSyncDetail");
+      if (last) {
+        const d = JSON.parse(last);
+        addLog(`Last sync result: samples=${d.parsedSamples} actions=${d.parsedActions} oilChanges=${d.parsedOilChanges}`, "info");
+      }
+    } catch {}
+
+    addLog("— Done —", "success");
+    setRunning(false);
+  }
+
+  const colMap = {
+    danger:  S.T.danger,
+    success: S.T.success,
+    warning: S.T.warning,
+    info:    S.T.accent,
+    muted:   S.T.textMuted,
+  };
+
+  return (
+    <div>
+      <div style={{ display:"flex", gap:8, marginBottom:12, flexWrap:"wrap" }}>
+        <button style={{ ...S.btnPrimary, fontSize:12 }} onClick={runDiag} disabled={running}>
+          <i className={`ti ${running ? "ti-loader" : "ti-stethoscope"}`}
+            style={{ animation: running ? "spin 1s linear infinite" : "none" }} aria-hidden />
+          {running ? " Running…" : " Run Diagnostics"}
+        </button>
+        <button style={{ ...S.btn, fontSize:12 }} onClick={onSync}>
+          <i className="ti ti-refresh" aria-hidden /> Sync Now
+        </button>
+        {log.length > 0 && (
+          <button style={{ ...S.btn, fontSize:12 }} onClick={() => setLog([])}>Clear</button>
+        )}
+      </div>
+
+      {syncMsg && (
+        <div style={{ padding:"8px 12px", borderRadius:6, marginBottom:10, fontSize:12,
+          background: syncMsg.startsWith("✓") ? S.T.successBg : syncMsg.startsWith("✗") ? S.T.dangerBg : S.T.infoBarBg,
+          color: syncMsg.startsWith("✓") ? S.T.success : syncMsg.startsWith("✗") ? S.T.danger : S.T.accent,
+          border: `1px solid ${syncMsg.startsWith("✓") ? S.T.success : syncMsg.startsWith("✗") ? S.T.danger : S.T.border}44` }}>
+          {syncMsg}
+        </div>
+      )}
+
+      {log.length > 0 && (
+        <div style={{ background:S.T.appBg, border:`1px solid ${S.T.border}`, borderRadius:8,
+          padding:12, fontFamily:"monospace", fontSize:11, lineHeight:1.9,
+          maxHeight:320, overflowY:"auto" }}>
+          {log.map((l, i) => (
+            <div key={i} style={{ color: colMap[l.color] || S.T.textPrimary }}>
+              <span style={{ color:S.T.textMuted, marginRight:8 }}>{l.t}</span>{l.msg}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {log.length === 0 && (
+        <div style={{ fontSize:12, color:S.T.textMuted }}>
+          Click "Run Diagnostics" to test the connection and inspect exactly what each sheet tab returns.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Settings Page ────────────────────────────────────────────────────────────
+function SettingsPage({ settings, onSave, onSync, syncState, syncMsg, themeName, onThemeChange }) {
+  const [form, setForm] = useState({ ...settings });
+  const [saved, setSaved] = useState(false);
+  const [testStatus, setTestStatus] = useState("");
+
+  function save() { onSave(form); setSaved(true); setTimeout(() => setSaved(false), 2500); }
+
+  async function testWebhook() {
+    if (!form.webhookUrl) { setTestStatus("❌ No webhook URL set"); return; }
+    setTestStatus("Testing…");
+    try {
+      const data = await sheetRead(form.webhookUrl);
+      if (data && (data.status === "ok" || data.samples !== undefined)) {
+        setTestStatus("✓ Connected — Apps Script responded OK");
+      } else if (data && data.error) {
+        setTestStatus(`⚠ Script error: ${data.error}`);
+      } else {
+        setTestStatus("⚠ Got a response but unexpected format");
+      }
+    } catch (e) {
+      setTestStatus(`❌ ${e.message}`);
+    }
+    setTimeout(() => setTestStatus(""), 8000);
+  }
+
+  const row = (label, key, placeholder, hint) => (
+    <div style={{ marginBottom: 18 }}>
+      <label style={{ ...S.label, fontSize: 12, fontWeight: 600, color: "#C8DFF0" }}>{label}</label>
+      <input style={{ ...S.input, fontSize: 13 }} value={form[key]||""}
+        placeholder={placeholder}
+        onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))} />
+      {hint && <p style={{ margin:"5px 0 0", fontSize:11, color:"#4A6A8A", lineHeight:1.6 }}>{hint}</p>}
+    </div>
+  );
+
+  const APPS_SCRIPT = `// ── Arabian Cement Oil Analysis — Apps Script ─────────────────
+// Deploy as Web App: Execute as Me · Who has access: Anyone
+// READ  → doGet  with ?action=readAll&callback=fnName  (JSONP)
+// WRITE → doPost with JSON body (no-cors fire-and-forget)
+
+function doGet(e) {
+  var callback = e.parameter.callback || "";
+  var action   = e.parameter.action   || "readAll";
+
+  var result;
+  if (action === "readAll") {
+    result = readAll();
+  } else {
+    result = {status:"ok", time: new Date().toISOString()};
+  }
+
+  var json = JSON.stringify(result);
+
+  if (callback) {
+    // JSONP — wrap in callback function so browser can read it cross-origin
+    return ContentService
+      .createTextOutput(callback + "(" + json + ")")
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return ContentService
+    .createTextOutput(json)
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  try {
+    // Robust text/json extraction to handle 'no-cors' header stripping
+    var raw = "";
+    if (e && e.postData && e.postData.contents) {
+      raw = e.postData.contents;
+    } else {
+      return json({status: "error", message: "No post data received"});
+    }
+
+    var data = JSON.parse(raw);
+    var ss   = SpreadsheetApp.getActiveSpreadsheet();
+
+    if (data.action === "append") {
+      appendRow(ss, data.sheet, data.row, data.headers);
+      return json({status:"ok"});
+    }
+    
+    if (data.action === "updateSampleTracker") {
+      var updateStatus = updateSampleTracker(ss, data);
+      return json({status: updateStatus ? "ok" : "equipment_not_found"});
+    }
+
+    if (data.action === "updateRow") {
+      var ok1 = updateRow(ss, data.sheet, data.matchCols, data.matchValues, data.row);
+      return json({status: ok1 ? "ok" : "row_not_found"});
+    }
+
+    if (data.action === "deleteRow") {
+      var ok2 = deleteRow(ss, data.sheet, data.matchCols, data.matchValues);
+      return json({status: ok2 ? "ok" : "row_not_found"});
+    }
+
+    return json({status:"ok", message: "No valid action specified"});
+  } catch(err) {
+    return json({status: "error", message: err.message});
+  }
+}
+
+// Find a row whose cells at matchCols (0-based column indices) equal matchValues.
+// Returns the 1-based sheet row number, or -1 if not found.
+// dataStartRow = 1-based row number where actual data begins (default 2, i.e. row after header).
+function findRowIndex(sheet, matchCols, matchValues, dataStartRow) {
+  var startRow = dataStartRow || 2;
+  var vals = sheet.getDataRange().getValues();
+  for (var i = startRow - 1; i < vals.length; i++) {
+    var allMatch = true;
+    for (var c = 0; c < matchCols.length; c++) {
+      var cellVal = String(vals[i][matchCols[c]] || "").trim();
+      var target  = String(matchValues[c] || "").trim();
+      if (cellVal !== target) { allMatch = false; break; }
+    }
+    if (allMatch) return i + 1; // 1-based row number
+  }
+  return -1;
+}
+
+// Returns the 1-based row number where data starts for a given sheet.
+function dataStartRowFor(sheetName) {
+  if (sheetName === "Data_Entry") return 6;   // rows 1-5 are title/instructions/header
+  if (sheetName === "Oil Change Log") return 4; // rows 1-3 are title/subtitle/header
+  if (sheetName === "Action Tracker") return 6; // rows 1-4 blank/title, row 5 = header
+  return 2; // standard: row 1 = header
+}
+
+// Overwrite an existing row's values with a new row array.
+function updateRow(ss, sheetName, matchCols, matchValues, newRow) {
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return false;
+  var rowIdx = findRowIndex(sheet, matchCols, matchValues, dataStartRowFor(sheetName));
+  if (rowIdx === -1) return false;
+  sheet.getRange(rowIdx, 1, 1, newRow.length).setValues([newRow]);
+  return true;
+}
+
+// Delete an existing row entirely.
+function deleteRow(ss, sheetName, matchCols, matchValues) {
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return false;
+  var rowIdx = findRowIndex(sheet, matchCols, matchValues, dataStartRowFor(sheetName));
+  if (rowIdx === -1) return false;
+  sheet.deleteRow(rowIdx);
+  return true;
+}
+
+function json(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function readAll() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  return {
+    samples:    readSheet(ss, "Data_Entry",         true),
+    actions:    readSheet(ss, "Action Tracker",     true),
+    oilChanges: readSheet(ss, "Oil Change Log",     true),
+    tracker:    readSheet(ss, "Oil Sample Tracker", false),
+  };
+}
+
+function readSheet(ss, name, skipHeader) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) return [];
+  var vals = sheet.getDataRange().getValues();
+  if (vals.length === 0) return [];
+  
+  // ── CUSTOM FIX FOR ARABIAN CEMENT DATA_ENTRY ──
+  // If this is the Data_Entry tab, adjust for the instruction row at Row 1
+  if (name === "Data_Entry") {
+    if (vals.length <= 5) return [];
+    // Index 0 (Row 1) = Instructions
+    // Index 1 (Row 2) = Headers
+    // Index 2 (Row 3) = First actual data row
+    return skipHeader ? vals.slice(5) : vals.slice(4);
+  }
+  
+  // ── CUSTOM FIX FOR ARABIAN CEMENT OIL CHANGE LOG ──
+  // Row 1 = title, Row 2 = subtitle/instructions, Row 3 = column headers, Row 4+ = data
+  if (name === "Oil Change Log") {
+    if (vals.length <= 3) return [];
+    return vals.slice(3);
+  }
+
+  // ── CUSTOM FIX FOR ARABIAN CEMENT ACTION TRACKER ──
+  // Rows 1-4 = blank/title, Row 5 = column headers, Row 6+ = data
+  if (name === "Action Tracker") {
+    if (vals.length <= 5) return [];
+    return skipHeader ? vals.slice(5) : vals.slice(4);
+  }
+
+  // Standard behavior for all other tabs
+  if (vals.length === 1 && skipHeader) return [];
+  return skipHeader ? vals.slice(1) : vals;
+}
+
+function appendRow(ss, sheetName, row, headers) {
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+    if (headers && headers.length) sheet.appendRow(headers);
+  }
+  sheet.appendRow(row);
+}
+
+function updateSampleTracker(ss, data) {
+  var sheet = ss.getSheetByName("Oil Sample Tracker");
+  if (!sheet) return false;
+  
+  var vals = sheet.getDataRange().getValues();
+  if (vals.length < 1) return false;
+
+  for (var i = 1; i < vals.length; i++) {
+    // Validates row has an ID and matches the equipmentCode cleanly
+    if (vals[i][0] && String(vals[i][0]).trim() === String(data.equipmentCode).trim()) {
+      
+      // Update primary Sample Date in Column B (index 2 / 2nd column)
+      sheet.getRange(i + 1, 2).setValue(data.sampleDate);
+      
+      // Dynamically scan headers to find the exact next empty column tracking header
+      var nextCol = 5; // Starts scanning from Column E
+      var lastCol = sheet.getLastColumn();
+      
+      while (nextCol <= lastCol && sheet.getRange(1, nextCol).getValue() !== "") {
+        nextCol++;
+      }
+      
+      // Apply the tracking sampleDate header and status payload
+      sheet.getRange(1, nextCol).setValue(data.sampleDate);
+      sheet.getRange(i + 1, nextCol).setValue(data.status);
+      return true; // Match found and successfully updated
+    }
+  }
+  return false; // Code iterated completely but no asset match was found
+}`;
+
+  return (
+    <div style={{ maxWidth: 740 }}>
+      <p style={S.sectionTitle}>Settings</p>
+
+      {/* Sheets card */}
+      <div style={{ ...S.card, marginBottom: 20 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:18 }}>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+            <rect x="3" y="3" width="18" height="18" rx="2" fill="#0F9D58"/>
+            <rect x="7" y="7" width="4" height="2" fill="white"/>
+            <rect x="13" y="7" width="4" height="2" fill="white"/>
+            <rect x="7" y="11" width="4" height="2" fill="white"/>
+            <rect x="13" y="11" width="4" height="2" fill="white"/>
+            <rect x="7" y="15" width="4" height="2" fill="white"/>
+            <rect x="13" y="15" width="4" height="2" fill="white"/>
+          </svg>
+          <div>
+            <p style={{ margin:0, fontWeight:700, color:S.T.textPrimary, fontSize:14 }}>Google Sheets — Primary Database</p>
+            <p style={{ margin:0, fontSize:11, color:"#6B8CAE" }}>Your Google Sheet is the single source of truth. The app reads and writes via Apps Script — no OAuth needed.</p>
+          </div>
+        </div>
+
+        {row("Google Sheet URL", "sheetUrl",
+          "https://docs.google.com/spreadsheets/d/XXXXXXX/edit",
+          "Paste your sheet URL here. Used for the 'Open Sheet' button.")}
+        {row("Apps Script Webhook URL", "webhookUrl",
+          "https://script.google.com/macros/s/XXXXXXX/exec",
+          "Deployed Web App URL from your Apps Script. Handles all reads and writes.")}
+
+        <div style={{ display:"flex", gap:8, marginBottom:16, alignItems:"center", flexWrap:"wrap" }}>
+          <button style={S.btn} onClick={testWebhook}>
+            <i className="ti ti-plug" aria-hidden/> Test Connection
+          </button>
+          <button style={{ ...S.btnPrimary, fontSize:12 }} onClick={onSync}
+            disabled={syncState==="loading"}>
+            <i className={`ti ${syncState==="loading"?"ti-loader":"ti-refresh"}`}
+              style={{ animation: syncState==="loading"?"spin 1s linear infinite":"none" }} aria-hidden/>
+            {syncState==="loading" ? " Syncing…" : " Sync Now"}
+          </button>
+          {form.sheetUrl && (
+            <a href={form.sheetUrl} target="_blank" rel="noopener noreferrer"
+              style={{ ...S.btn, textDecoration:"none", display:"inline-flex", alignItems:"center", gap:6 }}>
+              <i className="ti ti-external-link" aria-hidden/> Open Sheet
+            </a>
+          )}
+          {testStatus && (
+            <span style={{ fontSize:12, color: testStatus.startsWith("✓")?S.T.success:testStatus.startsWith("❌")?S.T.danger:S.T.warning }}>
+              {testStatus}
+            </span>
+          )}
+        </div>
+        {syncMsg && (
+          <div style={{ background:"#0A1628", borderRadius:6, padding:"8px 12px", marginBottom:12, fontSize:12,
+            color: syncMsg.startsWith("✓")?S.T.success:syncMsg.startsWith("✗")?S.T.danger:S.T.accent }}>
+            {syncMsg}
+          </div>
+        )}
+
+        {/* Setup steps */}
+        <div style={{ background:"#0A1628", borderRadius:8, padding:14 }}>
+          <p style={{ margin:"0 0 10px", fontSize:12, fontWeight:700, color:S.T.accent }}>
+            Setup (one-time, ~5 min)
+          </p>
+          {[
+            "1. Open your Google Sheet → Extensions → Apps Script",
+            "2. Delete all existing code, paste the script below",
+            "3. Click Save → Deploy → New deployment → Web app",
+            "4. Execute as: Me · Who has access: Anyone → Deploy",
+            "5. Copy the Web App URL and paste it above",
+            "6. Click 'Test Connection' — you should see 'Connected OK'",
+            "7. Click 'Sync Now' to load all existing sheet data into the app",
+          ].map((s,i) => <p key={i} style={{ margin:"3px 0", fontSize:11, color:"#8BAFC8" }}>{s}</p>)}
+
+          <div style={{ marginTop:12, background:"#060E1A", borderRadius:6, padding:12,
+            fontFamily:"monospace", fontSize:10, color:"#6BCF9E", lineHeight:1.8,
+            overflowX:"auto", whiteSpace:"pre", maxHeight:320, overflowY:"auto" }}>
+            {APPS_SCRIPT}
+          </div>
+        </div>
+      </div>
+
+      {/* App info */}
+      <div style={{ ...S.card, marginBottom:20 }}>
+        <p style={{ margin:"0 0 12px", fontWeight:700, color:S.T.textPrimary, fontSize:14 }}>App Status</p>
+        {[
+          ["Version", "3.0.0 — Sheets-only"],
+          ["Sheet URL", form.sheetUrl ? "✓ Set" : "Not configured"],
+          ["Webhook URL", form.webhookUrl ? "✓ Set" : "Not configured"],
+          ["Last sync", syncMsg || "Not synced yet"],
+        ].map(([k,v]) => (
+          <div key={k} style={{ display:"flex", justifyContent:"space-between", padding:"6px 0", borderBottom:"1px solid #1A2E45" }}>
+            <span style={{ fontSize:12, color:"#6B8CAE" }}>{k}</span>
+            <span style={{ fontSize:12, color:"#C8DFF0", maxWidth:300, textAlign:"right" }}>{v}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Diagnostics panel */}
+      <div style={{ ...S.card, marginBottom:20 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:14 }}>
+          <i className="ti ti-stethoscope" style={{ color:S.T.accent, fontSize:20 }} aria-hidden />
+          <div>
+            <p style={{ margin:0, fontWeight:700, color:S.T.textPrimary, fontSize:14 }}>Connection Diagnostics</p>
+            <p style={{ margin:0, fontSize:11, color:S.T.textSecondary }}>Run to see exactly what the Apps Script returns</p>
+          </div>
+        </div>
+        <DiagnosticsPanel webhookUrl={form.webhookUrl} syncMsg={syncMsg} onSync={onSync} />
+      </div>
+
+      {/* Theme picker */}
+      <div style={{ ...S.card, marginBottom:20 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
+          <i className="ti ti-palette" style={{ color:S.T.accent, fontSize:20 }}/>
+          <div>
+            <p style={{ margin:0, fontWeight:700, color:S.T.textPrimary, fontSize:14 }}>Appearance</p>
+            <p style={{ margin:0, fontSize:11, color:S.T.textSecondary }}>Choose a colour theme. Changes apply instantly.</p>
+          </div>
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))", gap:10 }}>
+          {Object.entries(THEMES).map(([name, t]) => {
+            const active = themeName === name;
+            return (
+              <div key={name} onClick={() => onThemeChange(name)}
+                style={{ cursor:"pointer", borderRadius:10, border:`2px solid ${active ? t.accent : t.border}`,
+                  overflow:"hidden", transition:"border-color 0.2s",
+                  boxShadow: active ? `0 0 0 2px ${t.accent}44` : "none" }}>
+                {/* Mini preview */}
+                <div style={{ background:t.appBg, padding:8 }}>
+                  <div style={{ display:"flex", gap:4, marginBottom:5 }}>
+                    <div style={{ width:28, background:t.sidebarBg, borderRadius:3, padding:"3px 4px" }}>
+                      {[t.accent, t.textSecondary, t.textSecondary].map((c,i) => (
+                        <div key={i} style={{ height:3, background:c, borderRadius:2, marginBottom:2, opacity:i===0?1:0.5 }}/>
+                      ))}
+                    </div>
+                    <div style={{ flex:1 }}>
+                      <div style={{ height:8, background:t.cardBg, borderRadius:3, border:`1px solid ${t.border}`, marginBottom:3, padding:2 }}>
+                        <div style={{ height:4, width:"60%", background:t.accent, borderRadius:2 }}/>
+                      </div>
+                      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:2 }}>
+                        {[t.cardBg, t.cardBg].map((c,i) => (
+                          <div key={i} style={{ height:12, background:c, borderRadius:2, border:`1px solid ${t.border}` }}/>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  {/* Colour dots */}
+                  <div style={{ display:"flex", gap:3, marginTop:2 }}>
+                    {[t.accent, "#2DC653", "#E63946", "#F4A261"].map((c,i) => (
+                      <div key={i} style={{ width:8, height:8, borderRadius:"50%", background:c }}/>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ background:t.sidebarBg, padding:"6px 8px", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                  <span style={{ fontSize:11, fontWeight:600, color:t.textPrimary }}>{name}</span>
+                  {active && <i className="ti ti-check" style={{ fontSize:12, color:t.accent }}/>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+        <button style={S.btnPrimary} onClick={save}>
+          <i className="ti ti-device-floppy" aria-hidden/> Save Settings
+        </button>
+        {saved && <span style={{ fontSize:12, color:S.T.success }}>✓ Saved</span>}
+      </div>
+    </div>
+  );
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+export default function App() {
+  const [page, setPage] = useState("dashboard");
+  const [sidebarOpen, setSidebarOpen] = useState(false); // mobile sidebar drawer
+  const [samples, setSamples] = useState([]);
+  const [actions, setActions] = useState([]);
+  const [oilChanges, setOilChanges] = useState([]);
+  const [selectedSample, setSelectedSample] = useState(null);
+  const [syncState, setSyncState] = useState("idle");
+  const [syncMsg, setSyncMsg] = useState("");
+  const [themeName, setThemeName] = useState(() => localStorage.getItem("oilapp_theme") || "Navy Dark");
+
+  // Apply theme globally on every render
+  const currentTheme = THEMES[themeName] || THEMES["Navy Dark"];
+  setGlobalTheme(currentTheme);
+
+  function changeTheme(name) {
+    setThemeName(name);
+    localStorage.setItem("oilapp_theme", name);
+  }
+
+  const [settings, setSettings] = useState(() => {
+    try {
+      const st = localStorage.getItem("oilapp_settings");
+      const parsed = st ? JSON.parse(st) : {};
+      return {
+        sheetUrl: parsed.sheetUrl || "https://docs.google.com/spreadsheets/d/1ULHg8o57KTZVbMsHGz7cDcyh89-B9zreI1-q6WsmLFg/edit?usp=sharing",
+        webhookUrl: parsed.webhookUrl || "https://script.google.com/macros/s/AKfycbxsza5HUKosnOtEwFaMESMPXKNLW2pAOLn7usKFmXC6crZtEcWL5rraoI6sWUERxqYv/exec"
+      };
+    } catch {
+      return {
+        sheetUrl: "https://docs.google.com/spreadsheets/d/1ULHg8o57KTZVbMsHGz7cDcyh89-B9zreI1-q6WsmLFg/edit?usp=sharing",
+        webhookUrl: "https://script.google.com/macros/s/AKfycbxsza5HUKosnOtEwFaMESMPXKNLW2pAOLn7usKFmXC6crZtEcWL5rraoI6sWUERxqYv/exec"
+      };
+    }
+  });
+
+  function saveSettings(st) {
+    setSettings(st);
+    localStorage.setItem("oilapp_settings", JSON.stringify(st));
+  }
+
+  // ── Full sync: read all sheets → replace state (sheet = source of truth) ──
+  async function syncAll() {
+    const url = settings.webhookUrl;
+    if (!url) { setSyncMsg("⚠ No webhook URL — add it in Settings first"); return; }
+    setSyncState("loading");
+    setSyncMsg("Syncing from Google Sheets…");
+    try {
+      const data = await sheetRead(url);
+
+      if (data.error) {
+        setSyncMsg(`✗ Script error: ${data.error}`);
+        setSyncState("error");
+        return;
+      }
+
+      const rawSamples    = data.samples    || [];
+      const rawActions    = data.actions    || [];
+      const rawOilChanges = data.oilChanges || [];
+
+      const sheetSamples    = rawSamples.filter(r => Array.isArray(r) && r[0]).map(rowToSample);
+      const sheetActions    = rawActions.filter(r => Array.isArray(r) && r[0]).map(rowToAction);
+      const sheetOilChanges = rawOilChanges.filter(r => Array.isArray(r) && r[0]).map(rowToOilChange);
+
+      setSamples(sheetSamples);
+      setActions(sheetActions);
+      setOilChanges(sheetOilChanges);
+
+      const now = new Date().toLocaleTimeString();
+      setSyncMsg(`✓ Synced — ${sheetSamples.length} samples · ${sheetActions.length} actions · ${sheetOilChanges.length} oil changes — ${now}`);
+      setSyncState("idle");
+
+      try {
+        sessionStorage.setItem("lastSyncDetail", JSON.stringify({
+          ok: true, time: now,
+          rawSampleRows: rawSamples.length,
+          rawActionRows: rawActions.length,
+          rawOilChangeRows: rawOilChanges.length,
+          parsedSamples: sheetSamples.length,
+          parsedActions: sheetActions.length,
+          parsedOilChanges: sheetOilChanges.length,
+          firstActionRow: rawActions[0] || null,
+          firstOilChangeRow: rawOilChanges[0] || null,
+        }));
+      } catch {}
+    } catch (e) {
+      setSyncMsg(`✗ Sync failed: ${e.message}`);
+      setSyncState("error");
+    }
+  }
+
+  // Auto-sync on load if webhook is configured
+  useEffect(() => {
+    if (settings.webhookUrl) syncAll();
+  }, [settings.webhookUrl]);
+
+  // ── Sheet column headers (for auto-creating missing tabs) ─────────────────
+  // ── Data mutations — write to Sheets + update local state ─────────────────
+  function addSample(incoming) {
+    const arr = Array.isArray(incoming) ? incoming : [incoming];
+    const existingIds = new Set(samples.map(s => s.sampleId).filter(Boolean));
+    const toAdd = arr.filter(s => !s.sampleId || !existingIds.has(s.sampleId));
+    if (!toAdd.length) { alert("All samples already exist (duplicate Sample ID)."); return; }
+
+    const withIds = toAdd.map(s => ({ ...s, _id: `${s.unitId}_${s.sampleId}_${fmtDate(s.sampledDate)}` }));
+    setSamples(prev => mergeById(prev, withIds));
+
+    // Write to Sheets
+    withIds.forEach(s => {
+      sheetWrite(settings.webhookUrl, {
+        action: "append", sheet: "Data_Entry",
+        row: sampleToRow(s), headers: DATA_ENTRY_HEADERS
+      });
+      sheetWrite(settings.webhookUrl, {
+        action: "updateSampleTracker",
+        equipmentCode: s.unitId, sampleDate: s.sampledDate, status: s.reportStatus
+      });
+    });
+
+    const newest = withIds.sort((a,b) => new Date(b.sampledDate||0)-new Date(a.sampledDate||0))[0];
+    setSelectedSample(newest);
+    setPage("equipment");
+    setSyncMsg(`✓ ${withIds.length} sample(s) saved to sheet — ${new Date().toLocaleTimeString()}`);
+  }
+
+  function addAction(a) {
+    const entry = { ...a, _id: `${a.equipmentCode||a.unitId}_${a.sampleDate||""}_${Date.now()}` };
+    setActions(prev => [...prev, entry]);
+    sheetWrite(settings.webhookUrl, {
+      action: "append", sheet: "Action Tracker",
+      row: actionToRow(entry), headers: ACTION_TRACKER_HEADERS
+    });
+  }
+
+  function updateAction(idx, updated) {
+    const original = actions[idx];
+    const merged = { ...original, ...updated };
+    setActions(prev => prev.map((a,i) => i===idx ? merged : a));
+    if (original._matchCols && original._matchValues) {
+      sheetUpdateRow(settings.webhookUrl, "Action Tracker", original._matchCols, original._matchValues, actionToRow(merged));
+    }
+  }
+
+  function deleteAction(idx) {
+    const original = actions[idx];
+    setActions(prev => prev.filter((_,i) => i!==idx));
+    if (original._matchCols && original._matchValues) {
+      sheetDeleteRow(settings.webhookUrl, "Action Tracker", original._matchCols, original._matchValues);
+    }
+  }
+
+  // Find a sample by _id and update both local state + sheet
+  function updateSample(original, updated) {
+    const merged = { ...original, ...updated };
+    setSamples(prev => prev.map(s => s._id === original._id ? merged : s));
+    if (original._matchCols && original._matchValues) {
+      sheetUpdateRow(settings.webhookUrl, "Data_Entry", original._matchCols, original._matchValues, sampleToRow(merged));
+    }
+    if (selectedSample && selectedSample._id === original._id) setSelectedSample(merged);
+    setSyncMsg(`✓ Sample updated — ${new Date().toLocaleTimeString()}`);
+  }
+
+  function deleteSample(sample) {
+    setSamples(prev => prev.filter(s => s._id !== sample._id));
+    if (sample._matchCols && sample._matchValues) {
+      sheetDeleteRow(settings.webhookUrl, "Data_Entry", sample._matchCols, sample._matchValues);
+    }
+    if (selectedSample && selectedSample._id === sample._id) setSelectedSample(null);
+    setSyncMsg(`✓ Sample deleted — ${new Date().toLocaleTimeString()}`);
+  }
+
+  function addOilChange(c) {
+    const entry = { ...c, _id: `${c.equipmentCode}_${c.lubricationPoint}_${c.oilType}_${Date.now()}` };
+    setOilChanges(prev => [...prev, entry]);
+    sheetWrite(settings.webhookUrl, {
+      action: "append", sheet: "Oil Change Log",
+      row: oilChangeToRow(entry), headers: OIL_CHANGE_HEADERS
+    });
+    setSyncMsg(`✓ Oil change saved to sheet — ${new Date().toLocaleTimeString()}`);
+  }
+
+  function updateOilChange(idx, updated) {
+    const original = oilChanges[idx];
+    const merged = { ...original, ...updated };
+    setOilChanges(prev => prev.map((c,i) => i===idx ? merged : c));
+    if (original._matchCols && original._matchValues) {
+      sheetUpdateRow(settings.webhookUrl, "Oil Change Log", original._matchCols, original._matchValues, oilChangeToRow(merged));
+    }
+  }
+
+  function deleteOilChange(idx) {
+    const original = oilChanges[idx];
+    setOilChanges(prev => prev.filter((_,i) => i!==idx));
+    if (original._matchCols && original._matchValues) {
+      sheetDeleteRow(settings.webhookUrl, "Oil Change Log", original._matchCols, original._matchValues);
+    }
+  }
+
+  function selectSample(s) { setSelectedSample(s); setPage("report"); }
+
+  const alertCount = samples.filter(s => s.reportStatus === "Alert").length;
+  const openActions = actions.filter(a => a.status==="Open"||a.status==="In Progress").length;
+  const syncDot = syncState==="loading" ? S.T.accent : syncState==="error" ? S.T.danger : settings.webhookUrl ? S.T.success : S.T.textSecondary;
+
+  return (
+    <div style={S.app}>
+      <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css"/>
+      <link rel="preconnect" href="https://fonts.googleapis.com"/>
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+      <style>{`
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{background:${currentTheme.appBg};font-family:'Inter',sans-serif}
+        ::-webkit-scrollbar{width:6px;height:6px}
+        ::-webkit-scrollbar-track{background:${currentTheme.appBg}}
+        ::-webkit-scrollbar-thumb{background:${currentTheme.scrollThumb};border-radius:3px}
+        input[type=date]::-webkit-calendar-picker-indicator{filter:${currentTheme.inputBg.startsWith("#F")||currentTheme.inputBg.startsWith("#E")?"none":"invert(1)"}}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+        tr:hover td{background:${currentTheme.accent}0A}
+        select option{background:${currentTheme.inputBg};color:${currentTheme.textPrimary}}
+        textarea{background:${currentTheme.inputBg};color:${currentTheme.textPrimary};border:1px solid ${currentTheme.border};border-radius:6px;outline:none;font-family:inherit}
+        textarea::placeholder{color:${currentTheme.textMuted}}
+
+        /* ── Mobile responsive layout ── */
+        .mobile-menu-btn{display:none}
+        .sidebar-backdrop{display:none}
+        @media (max-width: 860px){
+          .app-sidebar{
+            position:fixed; top:0; left:0; height:100vh; z-index:300;
+            transform:translateX(-100%); transition:transform .25s ease;
+            box-shadow:2px 0 16px rgba(0,0,0,.4);
+          }
+          .app-sidebar.open{ transform:translateX(0); }
+          .mobile-menu-btn{ display:inline-flex !important; }
+          .sidebar-backdrop.open{
+            display:block; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:250;
+          }
+          .app-topbar{ padding:10px 12px; flex-wrap:wrap; gap:8px; }
+          .app-topbar-title{ font-size:14px !important; }
+          .app-content{ padding:12px !important; }
+          .topbar-date{ display:none; }
+          .app-main{ width:100%; }
+        }
+        @media (max-width: 480px){
+          .topbar-actions .ti+span{ display:none; } /* icon-only buttons on tiny screens */
+        }
+      `}</style>
+
+      <div style={S.sidebar} className={`app-sidebar${sidebarOpen?" open":""}`}>
+        <div style={S.logo}>
+          <div style={{ display:"flex", alignItems:"center", gap:0, marginBottom:6 }}>
+            <svg width="34" height="58" viewBox="0 0 34 58" fill="none" style={{ flexShrink:0 }}>
+              {/* central stem */}
+              <path d="M17 56 C17 44 17 26 17 2" stroke="#1B9E3E" strokeWidth="2" strokeLinecap="round"/>
+              {/* 3 pairs of symmetric rounded leaflets */}
+              <ellipse cx="9"  cy="44" rx="8" ry="4.2" fill="#1B9E3E" transform="rotate(-28 9 44)"/>
+              <ellipse cx="25" cy="44" rx="8" ry="4.2" fill="#1B9E3E" transform="rotate(28 25 44)"/>
+              <ellipse cx="8"  cy="30" rx="8.5" ry="4.4" fill="#1B9E3E" transform="rotate(-22 8 30)"/>
+              <ellipse cx="26" cy="30" rx="8.5" ry="4.4" fill="#1B9E3E" transform="rotate(22 26 30)"/>
+              <ellipse cx="9"  cy="14" rx="7.5" ry="3.8" fill="#1B9E3E" transform="rotate(-32 9 14)"/>
+              <ellipse cx="25" cy="14" rx="7.5" ry="3.8" fill="#1B9E3E" transform="rotate(32 25 14)"/>
+              {/* top leaflet tip */}
+              <ellipse cx="17" cy="3" rx="3.4" ry="6.5" fill="#1B9E3E"/>
+            </svg>
+            <div style={{ background:"#2B3180", borderRadius:3, padding:"5px 9px 5px 8px", display:"flex", flexDirection:"column", gap:1 }}>
+              <div style={{ fontSize:11, fontWeight:900, color:"#FFF", letterSpacing:0.8, lineHeight:1.25 }}>ARABIAN CEMENT</div>
+              <div style={{ fontSize:9, color:"#FFF", textAlign:"right", fontFamily:"Arial,sans-serif", direction:"rtl", letterSpacing:0.3 }}>العربية للأسمنت</div>
+            </div>
+          </div>
+          <p style={{ fontSize:9, color:"#4A6A8A", margin:0, letterSpacing:0.8, textTransform:"uppercase" }}>Oil Analysis Management</p>
+        </div>
+
+        <nav style={S.nav}>
+          {NAV_ITEMS_DEF.map(n => (
+            <div key={n.id} style={S.navItem(page===n.id||(page==="report"&&n.id==="equipment"))}
+              onClick={() => { setPage(n.id); if (n.id!=="equipment") setSelectedSample(null); setSidebarOpen(false); }}>
+              <i className={`ti ${n.icon}`} style={{ fontSize:17 }} aria-hidden/>
+              <span>{n.label}</span>
+              {n.id==="dashboard" && alertCount>0 && (
+                <span style={{ marginLeft:"auto", background:S.T.danger, color:"#fff", borderRadius:20, padding:"1px 7px", fontSize:11, fontWeight:700 }}>{alertCount}</span>
+              )}
+              {n.id==="actions" && openActions>0 && (
+                <span style={{ marginLeft:"auto", background:S.T.warning, color:S.T.appBg, borderRadius:20, padding:"1px 7px", fontSize:10, fontWeight:700 }}>{openActions}</span>
+              )}
+            </div>
+          ))}
+        </nav>
+
+        <div style={{ padding:"12px 16px", borderTop:"1px solid #1E3A5F" }}>
+          {/* Sync status */}
+          <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:8 }}>
+            <span style={{ width:7, height:7, borderRadius:"50%", flexShrink:0, background:syncDot,
+              animation: syncState==="loading"?"pulse 1s ease-in-out infinite":"none" }}/>
+            <span style={{ fontSize:10, color:"#6B8CAE", flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+              {syncMsg || (settings.webhookUrl ? "Sheets connected" : "Add webhook in Settings")}
+            </span>
+          </div>
+          <button style={{ ...S.btnPrimary, width:"100%", fontSize:11, padding:"7px 10px",
+            opacity: syncState==="loading" ? 0.7 : 1 }}
+            onClick={syncAll} disabled={syncState==="loading"}>
+            <i className={`ti ${syncState==="loading"?"ti-loader":"ti-refresh"}`}
+              style={{ animation: syncState==="loading"?"spin 1s linear infinite":"none" }} aria-hidden/>
+            {syncState==="loading" ? " Syncing…" : " Sync from Sheets"}
+          </button>
+        </div>
+      </div>
+
+      <div className={`sidebar-backdrop${sidebarOpen?" open":""}`} onClick={() => setSidebarOpen(false)}></div>
+
+      <div style={S.main} className="app-main">
+        <div style={S.topbar} className="app-topbar">
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <button className="mobile-menu-btn" style={{ ...S.btn, padding:"6px 10px", display:"none" }}
+              onClick={() => setSidebarOpen(true)}>
+              <i className="ti ti-menu-2" aria-hidden/>
+            </button>
+            {(page==="report") && (
+              <button style={{ ...S.btn, padding:"6px 12px" }}
+                onClick={() => { setPage("equipment"); setSelectedSample(null); }}>
+                <i className="ti ti-arrow-left" aria-hidden/> Back
+              </button>
+            )}
+            <span className="app-topbar-title" style={{ fontSize:16, fontWeight:700, color:S.T.textPrimary }}>
+              {page==="dashboard" && "Dashboard"}
+              {page==="equipment" && (selectedSample ? `${selectedSample.unitId} — ${fmtDate(selectedSample.sampledDate)}` : "Equipment")}
+              {page==="report"    && selectedSample && `Report: ${selectedSample.unitId}`}
+              {page==="oilreport" && "Oil Analysis Report"}
+              {page==="upload"    && "Add Sample"}
+              {page==="actions"   && "Action Tracker"}
+              {page==="oilchange" && "Oil Change Log"}
+              {page==="tracker"   && "Oil Sample Tracker"}
+              {page==="settings"  && "Settings"}
+            </span>
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+            <span className="topbar-date" style={{ fontSize:12, color:"#6B8CAE" }}>{new Date().toLocaleDateString("en-GB",{dateStyle:"long"})}</span>
+            {settings.sheetUrl && (
+              <a href={settings.sheetUrl} target="_blank" rel="noopener noreferrer"
+                style={{ ...S.btn, textDecoration:"none", fontSize:12, display:"inline-flex", alignItems:"center", gap:4 }}>
+                <i className="ti ti-table" aria-hidden/> Sheet
+              </a>
+            )}
+            <button style={{ ...S.btn, fontSize:12 }} onClick={syncAll} disabled={syncState==="loading"}>
+              <i className={`ti ${syncState==="loading"?"ti-loader":"ti-refresh"}`}
+                style={{ animation:syncState==="loading"?"spin 1s linear infinite":"none" }} aria-hidden/>
+              {syncState==="loading" ? " …" : " Sync"}
+            </button>
+          </div>
+        </div>
+
+        <div style={S.content} className="app-content">
+          {page==="dashboard"  && <Dashboard samples={samples} actions={actions} oilChanges={oilChanges} />}
+          {page==="equipment"  && !selectedSample && <EquipmentList samples={samples} actions={actions} oilChanges={oilChanges} onSelectSample={selectSample} onEditSample={updateSample} onDeleteSample={deleteSample} />}
+          {(page==="report"||(page==="equipment"&&selectedSample)) && selectedSample && (
+            <SampleReport sample={selectedSample} actions={actions} oilChanges={oilChanges} onAddAction={addAction} onUpdateAction={updateAction} />
+          )}
+          {page==="upload"     && <UploadPDF onAdd={addSample} existingSamples={samples} webhookUrl={settings.webhookUrl} onSyncNeeded={syncAll} />}
+          {page==="oilreport"  && <OilAnalysisReport samples={samples} oilChanges={oilChanges} actions={actions} onAddAction={addAction} onUpdateAction={updateAction} />}
+          {page==="actions"    && <ActionTracker actions={actions} onUpdate={updateAction} onDelete={deleteAction} onAdd={addAction} samples={samples} />}
+          {page==="oilchange"  && <OilChangeLog oilChanges={oilChanges} onAdd={addOilChange} onUpdate={updateOilChange} onDelete={deleteOilChange} />}
+          {page==="tracker"    && <OilSampleTracker samples={samples} oilChanges={oilChanges} />}
+          {page==="settings"   && <SettingsPage settings={settings} onSave={saveSettings} onSync={syncAll} syncState={syncState} syncMsg={syncMsg} themeName={themeName} onThemeChange={changeTheme} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+
+// ─── Oil Change Log ────────────────────────────────────────────────────────────
+function OilChangeLog({ oilChanges, onAdd, onUpdate, onDelete }) {
+  const empty = { equipmentCode:"", lubricationPoint:"", frequency:"Oil Analysis", oilType:"", brand:"", quantity:"", changeDate:"", nextDueDate:"", status:"Current" };
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState(empty);
+  const [editTarget, setEditTarget] = useState(null); // { idx } when editing
+  const [filterEq, setFilterEq] = useState("");
+  const [filterStatus, setFilterStatus] = useState("All");
+  const [expandedAsset, setExpandedAsset] = useState(null);
+
+  const equipCodes = [...new Set(EQUIPMENT_REGISTRY.map(e => e.code))].sort();
+
+  function openAdd(presetCode) {
+    setForm(presetCode ? { ...empty, equipmentCode: presetCode } : empty);
+    setEditTarget(null); setShowForm(true);
+  }
+  function openEdit(idx) { setForm({ ...oilChanges[idx] }); setEditTarget({ idx }); setShowForm(true); }
+  function submit() {
+    if (!form.equipmentCode || !form.lubricationPoint) { alert("Asset and Lubrication Point are required."); return; }
+    if (editTarget) { onUpdate(editTarget.idx, form); }
+    else { onAdd(form); }
+    setShowForm(false); setForm(empty); setEditTarget(null);
+  }
+
+  const reg = EQUIPMENT_REGISTRY.find(e => e.code === form.equipmentCode);
+
+  const filtered = oilChanges.filter(c => {
+    if (filterEq && c.equipmentCode !== filterEq) return false;
+    if (filterStatus !== "All" && (c.status||"Current") !== filterStatus) return false;
+    return true;
+  });
+
+  // Group by asset (equipmentCode)
+  const byAsset = {};
+  filtered.forEach(c => {
+    const key = c.equipmentCode || "Unassigned";
+    if (!byAsset[key]) byAsset[key] = [];
+    byAsset[key].push(c);
+  });
+  const assetKeys = Object.keys(byAsset).sort();
+
+  const inp = (key, placeholder, type="text") => (
+    <input style={{ ...S.input, fontSize:12 }} type={type} value={form[key]||""} placeholder={placeholder}
+      onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))} />
+  );
+  const lbl = t => <label style={{ ...S.label, fontSize:11 }}>{t}</label>;
+
+  const statusColors = { Current:S.T.success, Overdue:S.T.danger, Scheduled:S.T.accent };
+  const counts = {
+    Current:  oilChanges.filter(c=>(c.status||"Current")==="Current").length,
+    Overdue:  oilChanges.filter(c=>c.status==="Overdue").length,
+    Scheduled:oilChanges.filter(c=>c.status==="Scheduled").length,
+  };
+
+  return (
+    <div>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16, flexWrap:"wrap", gap:8 }}>
+        <p style={S.sectionTitle}>Oil Change Log</p>
+        <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+          <EquipmentSelect value={filterEq||"All"} onChange={v => setFilterEq(v==="All"?"":v)} allowAll width={220} placeholder="All Assets" />
+          {["All","Current","Overdue","Scheduled"].map(s => (
+            <button key={s} style={{ ...S.btn, fontSize:11, padding:"4px 12px", background: filterStatus===s?S.T.border:"transparent", color: filterStatus===s?S.T.accent:S.T.textSecondary }}
+              onClick={() => setFilterStatus(s)}>{s}</button>
+          ))}
+          <button style={{ ...S.btnPrimary, fontSize:12 }} onClick={() => openAdd()}>
+            <i className="ti ti-plus" aria-hidden/> Add Entry
+          </button>
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))", gap:12, marginBottom:20 }}>
+        {[
+          { label:"Total Records", value:oilChanges.length, color:S.T.accent },
+          { label:"Current",       value:counts.Current, color:S.T.success },
+          { label:"Overdue",       value:counts.Overdue, color:S.T.danger },
+          { label:"Scheduled",     value:counts.Scheduled, color:S.T.warning },
+        ].map(card => (
+          <div key={card.label} style={{ ...S.card, textAlign:"center", padding:"14px 10px" }}>
+            <div style={{ fontSize:26, fontWeight:800, color:card.color }}>{card.value}</div>
+            <div style={{ fontSize:11, color:S.T.textSecondary, marginTop:2 }}>{card.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Entry form */}
+      {showForm && (
+        <div style={{ ...S.card, marginBottom:20, borderTop:`3px solid ${S.T.accent}` }}>
+          <p style={{ fontWeight:700, color:S.T.textPrimary, marginBottom:14, fontSize:14 }}>
+            {editTarget ? "Edit Oil Change Entry" : "New Oil Change Entry"}
+          </p>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))", gap:12, marginBottom:12 }}>
+            <div>
+              {lbl("Asset (Equipment Code) *")}
+              <EquipmentSelect value={form.equipmentCode} onChange={v => setForm(f => ({ ...f, equipmentCode: v }))} width="100%" />
+            </div>
+            <div>{lbl("Lubrication Point *")}{inp("lubricationPoint", "e.g. Gear box - R")}</div>
+            <div>{lbl("Frequency")}{inp("frequency", "e.g. Oil Analysis / 2 Y")}</div>
+            <div>{lbl("Oil Type")}{inp("oilType", reg?.lubricant||"e.g. Mobil SHC 630")}</div>
+            <div>{lbl("Brand")}{inp("brand", "e.g. Mobil")}</div>
+            <div>{lbl("Qty (ltr.)")}{inp("quantity","e.g. 41","number")}</div>
+            <div>{lbl("Last Change")}{inp("changeDate","","date")}</div>
+            <div>{lbl("Next Oil Change")}{inp("nextDueDate","","date")}</div>
+            <div>
+              {lbl("Status")}
+              <select style={{ ...S.select, width:"100%", fontSize:12 }} value={form.status||"Current"} onChange={e => setForm(f=>({...f,status:e.target.value}))}>
+                {["Current","Overdue","Scheduled"].map(s => <option key={s}>{s}</option>)}
+              </select>
+            </div>
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <button style={S.btnPrimary} onClick={submit}><i className="ti ti-device-floppy" aria-hidden/> Save</button>
+            <button style={S.btn} onClick={() => { setShowForm(false); setEditTarget(null); }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Card grid grouped by asset */}
+      {assetKeys.length === 0 ? (
+        <div style={{ ...S.card, textAlign:"center", padding:40 }}>
+          <i className="ti ti-oil" style={{ fontSize:36, color:S.T.border, display:"block", marginBottom:8 }} />
+          <div style={{ color:S.T.textSecondary, fontSize:14 }}>No oil change records yet.</div>
+          <div style={{ color:S.T.textMuted, fontSize:12, marginTop:4 }}>Click "Add Entry" or run Sync to pull from the sheet.</div>
+        </div>
+      ) : (
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(340px,1fr))", gap:14 }}>
+          {assetKeys.map(asset => {
+            const points = byAsset[asset];
+            const reg2 = EQUIPMENT_REGISTRY.find(e => e.code === asset);
+            const worstStatus = points.some(p=>p.status==="Overdue") ? "Overdue" : points.some(p=>p.status==="Scheduled") ? "Scheduled" : "Current";
+            return (
+              <div key={asset} style={{ ...S.card, padding:0, overflow:"hidden" }}>
+                <div style={{ padding:"12px 14px", borderBottom:`1px solid ${S.T.border}`, display:"flex", alignItems:"center", justifyContent:"space-between", gap:8 }}>
+                  <div>
+                    <div style={{ fontFamily:"monospace", fontWeight:700, fontSize:14, color:S.T.accent }}>{asset}</div>
+                    {reg2 && <div style={{ fontSize:11, color:S.T.textSecondary, maxWidth:220, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{reg2.description}</div>}
+                  </div>
+                  <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                    <span style={{ background:(statusColors[worstStatus]||S.T.textSecondary)+"22", color:statusColors[worstStatus]||S.T.textSecondary, borderRadius:4, padding:"2px 8px", fontSize:11, fontWeight:700 }}>
+                      {points.length} point{points.length>1?"s":""}
+                    </span>
+                    <button style={{ ...S.btn, padding:"3px 8px", fontSize:11 }} onClick={() => openAdd(asset)} title="Add lubrication point">
+                      <i className="ti ti-plus" aria-hidden/>
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  {points.map((c, pi) => {
+                    const globalIdx = oilChanges.indexOf(c);
+                    const isOverdue = c.status === "Overdue";
+                    return (
+                      <div key={pi} style={{ padding:"10px 14px", borderBottom: pi<points.length-1 ? `1px solid ${S.T.border2}` : "none",
+                        display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+                        <div style={{ flex:"1 1 140px", minWidth:120 }}>
+                          <div style={{ fontSize:12, fontWeight:600, color:S.T.textPrimary }}>{c.lubricationPoint || "—"}</div>
+                          <div style={{ fontSize:11, color:S.T.textSecondary }}>{c.oilType||"—"}{c.brand?` · ${c.brand}`:""}{c.quantity?` · ${c.quantity}L`:""}</div>
+                        </div>
+                        <div style={{ fontSize:11, color:S.T.textSecondary, minWidth:90 }}>
+                          <div>Last: <span style={{ color:S.T.textHighlight }}>{fmtDate(c.changeDate)}</span></div>
+                          <div>Next: <span style={{ color: isOverdue?S.T.danger:S.T.textHighlight, fontWeight: isOverdue?700:400 }}>{fmtDate(c.nextDueDate)}</span></div>
+                        </div>
+                        <span style={{ background:(statusColors[c.status||"Current"]||S.T.textSecondary)+"22", color:statusColors[c.status||"Current"]||S.T.textSecondary, borderRadius:4, padding:"2px 8px", fontSize:11, fontWeight:700, whiteSpace:"nowrap" }}>
+                          {c.status||"Current"}
+                        </span>
+                        <div style={{ display:"flex", gap:4 }}>
+                          <button style={{ ...S.btn, padding:"2px 7px", fontSize:11 }} onClick={() => openEdit(globalIdx)}>
+                            <i className="ti ti-edit" aria-hidden/>
+                          </button>
+                          <button style={{ ...S.btn, padding:"2px 7px", fontSize:11, color:S.T.danger, borderColor:S.T.danger }}
+                            onClick={() => { if(window.confirm("Delete this lubrication point record?")) onDelete(globalIdx); }}>
+                            <i className="ti ti-trash" aria-hidden/>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Oil Sample Tracker ────────────────────────────────────────────────────────
+function OilSampleTracker({ samples, oilChanges }) {
+  const [filterClass, setFilterClass] = useState("All");
+  const [filterStatus, setFilterStatus] = useState("All");
+  const [search, setSearch] = useState("");
+  const [expanded, setExpanded] = useState(null);
+
+  const now = new Date();
+
+  // Group samples by equipment code
+  const samplesByEq = {};
+  samples.forEach(s => {
+    if (!s.unitId) return;
+    if (!samplesByEq[s.unitId]) samplesByEq[s.unitId] = [];
+    samplesByEq[s.unitId].push(s);
+  });
+
+  // All oil changes per equipment (sorted)
+  const changesByEq = {};
+  (oilChanges||[]).forEach(c => {
+    if (!c.equipmentCode || !c.changeDate || c.changeDate === "—") return;
+    if (!changesByEq[c.equipmentCode]) changesByEq[c.equipmentCode] = [];
+    changesByEq[c.equipmentCode].push(c);
+  });
+  const lastChangByEq = {};
+  Object.entries(changesByEq).forEach(([code, list]) => {
+    const sorted = [...list].sort((a,b) => new Date(b.changeDate) - new Date(a.changeDate));
+    lastChangByEq[code] = sorted[0]?.changeDate;
+  });
+
+  const assetClasses = ["All", ...new Set(EQUIPMENT_REGISTRY.map(e => e.assetClass).filter(Boolean))];
+
+  const filteredEquip = EQUIPMENT_REGISTRY.filter(eq => {
+    if (filterClass !== "All" && eq.assetClass !== filterClass) return false;
+    if (search && !eq.code.toLowerCase().includes(search.toLowerCase()) && !eq.description.toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  });
+
+  // Overall status for equipment
+  function getEqStatus(eq) {
+    const eqSamples = samplesByEq[eq.code] || [];
+    if (eqSamples.length === 0) return "No Samples";
+    const latest = eqSamples.sort((a,b) => new Date(b.sampledDate||0) - new Date(a.sampledDate||0))[0];
+    const lastDate = new Date(latest.sampledDate);
+    const intervalMonths = parseInt(eq.interval) || 6;
+    const monthsDiff = (now - lastDate) / (1000*60*60*24*30);
+    if (monthsDiff > intervalMonths) return "Overdue";
+    if (latest.reportStatus === "Alert") return "Alert";
+    if (latest.reportStatus === "Warning" || latest.reportStatus === "Caution") return "Caution";
+    return "Normal";
+  }
+
+  const allStatuses = filteredEquip.map(eq => getEqStatus(eq));
+  const summary = {
+    Normal:   allStatuses.filter(s=>s==="Normal").length,
+    Alert:    allStatuses.filter(s=>s==="Alert").length,
+    Caution:  allStatuses.filter(s=>s==="Caution").length,
+    Overdue:  allStatuses.filter(s=>s==="Overdue").length,
+    NoSample: allStatuses.filter(s=>s==="No Samples").length,
+  };
+
+  const statusColor = { Normal:S.T.success, Alert:S.T.danger, Caution:S.T.warning, Overdue:S.T.warning, "No Samples":S.T.textSecondary };
+  const dotColor    = { Normal:S.T.success, Alert:S.T.danger, Caution:S.T.warning, Warning:S.T.warning };
+
+  const displayEquip = filterStatus === "All" ? filteredEquip
+    : filteredEquip.filter(eq => getEqStatus(eq) === filterStatus);
+
+  return (
+    <div>
+      {/* Header + filters */}
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16, flexWrap:"wrap", gap:8 }}>
+        <p style={S.sectionTitle}>Oil Sample Tracker</p>
+        <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+          <input style={{ ...S.input, width:200, fontSize:12 }} placeholder="Search equipment..." value={search} onChange={e=>setSearch(e.target.value)} />
+          <select style={{ ...S.select, width:160, fontSize:12 }} value={filterClass} onChange={e=>setFilterClass(e.target.value)}>
+            {assetClasses.map(c => <option key={c}>{c}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))", gap:10, marginBottom:20 }}>
+        {[
+          { label:"Normal",    value:summary.Normal,   color:S.T.success, status:"Normal" },
+          { label:"Alert",     value:summary.Alert,    color:S.T.danger, status:"Alert" },
+          { label:"Caution",   value:summary.Caution,  color:S.T.warning, status:"Caution" },
+          { label:"Overdue",   value:summary.Overdue,  color:S.T.warning, status:"Overdue" },
+          { label:"No Samples",value:summary.NoSample, color:S.T.textSecondary, status:"No Samples" },
+        ].map(c => (
+          <div key={c.label} style={{ ...S.card, textAlign:"center", padding:"10px 8px", cursor:"pointer",
+            border:`1px solid ${filterStatus===c.status ? c.color : S.T.border}`, borderRadius:8 }}
+            onClick={() => setFilterStatus(filterStatus===c.status ? "All" : c.status)}>
+            <div style={{ fontSize:24, fontWeight:800, color:c.color }}>{c.value}</div>
+            <div style={{ fontSize:10, color:S.T.textSecondary, marginTop:2 }}>{c.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Legend */}
+      <div style={{ display:"flex", gap:14, marginBottom:12, flexWrap:"wrap" }}>
+        {[
+          { color:S.T.success, label:"Normal sample" },
+          { color:S.T.warning, label:"Caution sample" },
+          { color:S.T.danger, label:"Alert sample" },
+          { color:S.T.accent, label:"Oil changed" },
+        ].map(l => (
+          <div key={l.label} style={{ display:"flex", alignItems:"center", gap:5, fontSize:11, color:S.T.textSecondary }}>
+            <span style={{ width:10, height:10, borderRadius:"50%", background:l.color, display:"inline-block" }}/>
+            {l.label}
+          </div>
+        ))}
+      </div>
+
+      {/* Equipment list */}
+      <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+        {displayEquip.length === 0 && (
+          <div style={{ ...S.card, textAlign:"center", padding:30, color:S.T.textMuted, fontSize:13 }}>No equipment matches the current filters.</div>
+        )}
+        {displayEquip.map(eq => {
+          const eqSamples = (samplesByEq[eq.code] || []).slice().sort((a,b) => new Date(a.sampledDate||0) - new Date(b.sampledDate||0));
+          const eqChanges = (changesByEq[eq.code] || []);
+          const latest = eqSamples[eqSamples.length-1];
+          const status = getEqStatus(eq);
+          const isExpanded = expanded === eq.code;
+
+          // Build combined timeline events (samples + oil changes), sorted by date
+          const events = [
+            ...eqSamples.map(s => ({ type:"sample", date:s.sampledDate, sample:s })),
+            ...eqChanges.map(c => ({ type:"change", date:c.changeDate, change:c })),
+          ].filter(e => e.date && e.date !== "—")
+           .sort((a,b) => new Date(a.date) - new Date(b.date));
+
+          return (
+            <div key={eq.code} style={{ ...S.card, padding:0, overflow:"hidden" }}>
+              <div style={{ padding:"12px 16px", display:"flex", alignItems:"center", gap:12, cursor:"pointer", flexWrap:"wrap" }}
+                onClick={() => setExpanded(isExpanded ? null : eq.code)}>
+                <i className={`ti ti-chevron-${isExpanded?"down":"right"}`} style={{ fontSize:14, color:S.T.textSecondary }} aria-hidden/>
+                <div style={{ minWidth:120 }}>
+                  <div style={{ fontFamily:"monospace", fontWeight:700, fontSize:13, color:S.T.accent }}>{eq.code}</div>
+                  <div style={{ fontSize:11, color:S.T.textSecondary, maxWidth:260, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{eq.description}</div>
+                </div>
+                <span style={{ fontSize:11, color:S.T.textMuted }}>{eq.assetClass}</span>
+                <span style={{ fontSize:11, color:S.T.textMuted }}>Interval: {eq.interval}</span>
+                <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:14, flexWrap:"wrap" }}>
+                  <span style={{ fontSize:11, color:S.T.textSecondary }}>Last sample: <span style={{ color:S.T.textHighlight, fontWeight:600 }}>{fmtDate(latest?.sampledDate)}</span></span>
+                  <span style={{ fontSize:11, color:S.T.textSecondary }}>Last change: <span style={{ color:S.T.textHighlight, fontWeight:600 }}>{fmtDate(lastChangByEq[eq.code])}</span></span>
+                  <span style={{ background:(statusColor[status]||S.T.textSecondary)+"22", color:statusColor[status]||S.T.textSecondary, borderRadius:4, padding:"3px 10px", fontSize:11, fontWeight:700, whiteSpace:"nowrap" }}>
+                    {status}
+                  </span>
+                </div>
+              </div>
+
+              {isExpanded && (
+                <div style={{ borderTop:`1px solid ${S.T.border}`, padding:"16px", background:S.T.cardSubBg }}>
+                  {events.length === 0 ? (
+                    <div style={{ fontSize:12, color:S.T.textMuted, textAlign:"center", padding:10 }}>No samples or oil changes recorded for this equipment.</div>
+                  ) : (
+                    <div style={{ overflowX:"auto", paddingBottom:6 }}>
+                      <div style={{ display:"flex", alignItems:"flex-end", gap:0, minWidth:events.length*90, position:"relative", paddingTop:30 }}>
+                        {/* connecting line */}
+                        <div style={{ position:"absolute", top:36, left:30, right:30, height:2, background:S.T.border }}/>
+                        {events.map((ev, i) => {
+                          const color = ev.type === "change" ? S.T.accent : (dotColor[ev.sample.reportStatus] || S.T.textSecondary);
+                          const label = ev.type === "change"
+                            ? `Oil change${ev.change.lubricationPoint ? " — "+ev.change.lubricationPoint : ""}`
+                            : `${ev.sample.reportStatus} — ${ev.sample.sampleId||""}`;
+                          return (
+                            <div key={i} style={{ flex:"0 0 90px", display:"flex", flexDirection:"column", alignItems:"center", position:"relative" }}>
+                              <div title={label} style={{ width: ev.type==="change"?12:16, height: ev.type==="change"?12:16,
+                                borderRadius: ev.type==="change" ? 3 : "50%",
+                                background:color, border:`2px solid ${S.T.cardSubBg}`, zIndex:1,
+                                display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer" }}>
+                                {ev.type==="change" && <i className="ti ti-oil" style={{ fontSize:8, color:"#fff" }} aria-hidden/>}
+                              </div>
+                              <div style={{ fontSize:10, color:S.T.textSecondary, marginTop:6, textAlign:"center", whiteSpace:"nowrap" }}>{fmtDate(ev.date)}</div>
+                              {ev.type==="sample" && (
+                                <div style={{ fontSize:9, color:color, fontWeight:700, marginTop:2 }}>{ev.sample.reportStatus}</div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Sample details table */}
+                  {eqSamples.length > 0 && (
+                    <div style={{ marginTop:14, overflowX:"auto" }}>
+                      <table style={{ ...S.table, fontSize:11 }}>
+                        <thead>
+                          <tr>
+                            {["Date","Status","Equip. Rating","Lube Rating","Contam.","Visc@40°C","TAN","Water"].map(h => <th key={h} style={S.th}>{h}</th>)}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[...eqSamples].reverse().map((s,i) => (
+                            <tr key={i}>
+                              <td style={{ ...S.td, whiteSpace:"nowrap" }}>{fmtDate(s.sampledDate)}</td>
+                              <td style={S.td}><span style={S.badge(s.reportStatus)}>{s.reportStatus}</span></td>
+                              <td style={S.td}><span style={S.badge(s.equipmentRating)}>{s.equipmentRating||"—"}</span></td>
+                              <td style={S.td}><span style={S.badge(s.lubricantRating)}>{s.lubricantRating||"—"}</span></td>
+                              <td style={S.td}><span style={S.badge(s.contaminationRating)}>{s.contaminationRating||"—"}</span></td>
+                              <td style={{ ...S.td, fontFamily:"monospace" }}>{s.visc40C||"—"}</td>
+                              <td style={{ ...S.td, fontFamily:"monospace" }}>{s.tan||"—"}</td>
+                              <td style={{ ...S.td, fontFamily:"monospace" }}>{s.water||"—"}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ marginTop:8, fontSize:11, color:S.T.textMuted }}>
+        Showing {displayEquip.length} of {EQUIPMENT_REGISTRY.length} equipment · {samples.length} total samples recorded
+      </div>
+    </div>
+  );
+}
+
+const STATUS_COLORS = {
+  Alert: { bg: "#E63946", text: "#fff" },
+  Normal: { bg: "#2DC653", text: "#fff" },
+  Warning: { bg: "#F4A261", text: "#fff" },
+};
+
+const ACTION_STATUSES = ["Open", "In Progress", "Closed", "Waiting Stoppage"];
+const ACTION_STATUS_COLORS = {
+  Open: { bg: "#E63946", text: "#fff" },
+  "In Progress": { bg: "#F4A261", text: "#fff" },
+  Closed: { bg: "#2DC653", text: "#fff" },
+  "Waiting Stoppage": { bg: "#00B4D8", text: "#fff" },
+};
+
+const DRIVE_FILE_NAME = "oil_analysis_db.json";
+
+// ─── Equipment Registry ──────────────────────────────────────────────────────
+const EQUIPMENT_REGISTRY = [
+  { code:"111.AF040 (L)", description:"Clay apron feeder left geared motor", assetId:"30921624", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"BREVINI", model:"SL2PLB08516/FS/223.8/IEC 225 C" },
+  { code:"111.AF040 (R)", description:"Clay apron feeder right gearbox", assetId:"30921623", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"BREVINI", model:"SL2PLB08516/FS/223.8/IEC 225 C" },
+  { code:"111.AF060 (L)", description:"Limestone Apron Feeder Left Gear Box", assetId:"30690505", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"BREVINI", model:"SL2 PLB 085.16/FS/223,8ILNC22" },
+  { code:"111.AF060 (R)", description:"Limestone Apron Feeder right Gear Box- BREVINI", assetId:"30690504", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"111.BC210", description:"Belt Conveyor Gearbox - Rossi", assetId:"30958404", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"ROSSI", model:"R 3I 320 UP2A / 30 - B3" },
+  { code:"111.BC330 (L1)", description:"Belt conveyor first left Gearbox", assetId:"30767436", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"3 Months", manufacturer:"ROSSI", model:"H02 R 3I 400 UP1A / 35.9" },
+  { code:"111.BC330 (L2)", description:"Belt conveyor second left Gearbox", assetId:"30767438", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"3 Months", manufacturer:"ROSSI", model:"H02 R 3I 400 UP1A / 35.9" },
+  { code:"111.BC330 (R1)", description:"Belt conveyor first right Gearbox", assetId:"30767435", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"3 Months", manufacturer:"ROSSI", model:"H02 R 3I 400 UP1A / 35.9" },
+  { code:"111.BC330 (R2)", description:"Belt conveyor second right Gearbox", assetId:"30767437", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"3 Months", manufacturer:"ROSSI", model:"H02 R 3I 400 UP1A / 35.9" },
+  { code:"111.HC100 (HY)", description:"Crusher hydraulic cylinder station", assetId:"30958405", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"111.HC100 (IR)", description:"Inlet Roller Gear Box", assetId:"30958406", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"3 Months", manufacturer:"FLENDER", model:"FLENDER H 3 SH 10 B" },
+  { code:"111.HC100 (RGB)", description:"Hammer Crusher Rotor Gear Box", assetId:"30690503", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"3 Months", manufacturer:"FLENDER", model:"H1SH-11+ OLOO 06" },
+  { code:"123.BC100", description:"Belt conveyor Gearbox", assetId:"30958407", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"ROSSI", model:"H02 - R 4I 401 UP1L / 191" },
+  { code:"123.BC200", description:"Belt Conveyor Gearbox", assetId:"30958408", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"ROSSI", model:"G05 - R 3I 320 UP2A / 37.4" },
+  { code:"131.BC100", description:"Belt Conveyor Gearbox", assetId:"30958409", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"ROSSI", model:"H02 - R 3I 400 UP1L / 45.2 - B" },
+  { code:"131.BC500 (M01)", description:"Belt Conveyor Gearbox", assetId:"30958410", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"ROSSI", model:"G0 5R 3I 360 UP2A / 46.8" },
+  { code:"131.BC500 (M02)", description:"Belt Conveyor Gearbox", assetId:"50448880", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"ROSSI", model:"G0 5R 3I 360 UP2A / 46.8" },
+  { code:"131.RE300", description:"Take up unit Tank for Scraper Chain", assetId:"30958411", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"131.RE300.M11", description:"Reclaimer Chain Scraper gearbox", assetId:"50609993", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"6 Months", manufacturer:"ROSSI", model:"MR C2I 360 UO2V - 250M 4...B5 /" },
+  { code:"131.RE300.M12", description:"Reclaimer Chain Scraper gearbox", assetId:"30825024", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"6 Months", manufacturer:"ROSSI", model:"MR C2I 360 UO2V - 250M 4...B5 /" },
+  { code:"131.ST200 (HY)", description:"Jib arm Hydraulic Pump Station", assetId:"30958412", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"131.ST200.M11", description:"Stacker Belt gearbox", assetId:"30829918", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"6 Months", manufacturer:"ROSSI", model:"MR ICI 160 UO3A - 132M 4 ... B5" },
+  { code:"131.ST200.M12", description:"Stacker Belt gearbox", assetId:"30829919", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"6 Months", manufacturer:"ROSSI", model:"MR ICI 160 UO3A - 132M 4 ... B5" },
+  { code:"261.CV600", description:"Drag chain for AF#2", assetId:"51800223", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"If needed", manufacturer:"N/A", model:"N/A" },
+  { code:"261.SH050 (T)", description:"Shredder - Hydraulic Sys.", assetId:"40435944", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"If needed", manufacturer:"N/A", model:"FLS" },
+  { code:"263.AF010", description:"Cargo floor hydraulic tank", assetId:"51370276", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"If needed", manufacturer:"ROSSI", model:"SF 4X6F CROSS BAR COOLER" },
+  { code:"321.BE220", description:"Bucket Elevator Gearbox", assetId:"30920702", assetClass:"Gear Drive", lubricant:"MOBILEGEAR 600 XP 320", interval:"6 Months", manufacturer:"FLENDER", model:"B3 DH 10 D" },
+  { code:"321.FN400(Fr.B)", description:"Raw Mill free bearing", assetId:"30990149", assetClass:"Circulating System", lubricant:"MOBIL DTE 26", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"321.FN400(Fx.B)", description:"Raw Mill fan fixed bearing", assetId:"30990148", assetClass:"Circulating System", lubricant:"MOBIL DTE 26", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"321.HY110", description:"Hydraulic tensioning system for mill", assetId:"30767432", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"Monthly", manufacturer:"PMC", model:"ATOX MILL 45 HYDRAULIC TENSION" },
+  { code:"321.LQ120 (R1)", description:"Roller Lubrication Return R1 (filter Cup)", assetId:"", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"If needed", manufacturer:"N/A", model:"N/A" },
+  { code:"321.LQ120 (R2)", description:"Roller Lubrication Return R2 (filter Cup)", assetId:"", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"If needed", manufacturer:"N/A", model:"N/A" },
+  { code:"321.LQ120 (R3)", description:"Roller Lubrication Return R3 (filter Cup)", assetId:"30629913", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"If needed", manufacturer:"N/A", model:"N/A" },
+  { code:"321.LQ120 (T)", description:"Roller Lubrication Unit (Tank)", assetId:"30626957", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"Monthly", manufacturer:"MAAG", model:"" },
+  { code:"321.LQ145(GB)", description:"Gear lubrication Gear Box", assetId:"50161820", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 320", interval:"Monthly", manufacturer:"MAAG", model:"WPU-142/C-330 ATOX 45" },
+  { code:"321.LQ145 (T)", description:"Gear lubrication pump station Tank", assetId:"30767433", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 320", interval:"If needed", manufacturer:"MAAG", model:"WPU-142/C-330 ATOX 45" },
+  { code:"321.MD152", description:"Dynamic Separator Gearbox", assetId:"30767434", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"B3SV11" },
+  { code:"321.RF090", description:"Rotary feeder Gear Box", assetId:"30958413", assetClass:"Gear Drive", lubricant:"MOBIL SHC 639", interval:"6 Months", manufacturer:"FLENDER", model:"Z108-M160L4" },
+  { code:"R2.322.BE220", description:"R2 Bucket Elevator Gearbox", assetId:"40104845", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"6 Months", manufacturer:"FLENDER", model:"B3 DH 10 D" },
+  { code:"322.FN400 (Fr.B)", description:"RM#2 Fan Free bearing", assetId:"40110632", assetClass:"Circulating System", lubricant:"MOBILE DTE 26", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"322.FN400 (Fx.B)", description:"RM#2 Fan fixed bearing", assetId:"40110637", assetClass:"Circulating System", lubricant:"MOBILE DTE 26", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.322.HY110", description:"Hydraulic tensioning sys. Mill 2", assetId:"40047885", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"Monthly", manufacturer:"N/A", model:"N/A" },
+  { code:"322.LQ120 (R1)", description:"Rolle Lub. Return R1 (Filter Cap)", assetId:"40109829", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"If needed", manufacturer:"N/A", model:"N/A" },
+  { code:"322.LQ120 (R2)", description:"Rolle Lub. Return R2 (Filter Cap)", assetId:"40110623", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"If needed", manufacturer:"N/A", model:"N/A" },
+  { code:"322.LQ120 (R3)", description:"Rolle Lub. Return R3 (Filter Cap)", assetId:"40110624", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"If needed", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.322.LQ120(T)", description:"Roller Lubrication Unit (Tank)", assetId:"40047887", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"Monthly", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.322.LQ145 (GB)", description:"Mill 2 gear Box", assetId:"50161821", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 320", interval:"Monthly", manufacturer:"MAAG", model:"WPU-142/C-330 ATOX 45" },
+  { code:"R2.322.LQ145 (T)", description:"Mill2 gear Lub pump station tank", assetId:"40047888", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 320", interval:"If needed", manufacturer:"MAAG", model:"WPU-142/C-330 ATOX 45" },
+  { code:"322.MD152", description:"Dynamic Separator Gearbox L#2", assetId:"40110630", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"B3 SV11" },
+  { code:"R2.322.RF090", description:"Rotary feeder Gear Box", assetId:"40110631", assetClass:"Gear Drive", lubricant:"MOBIL SHC 639", interval:"6 Months", manufacturer:"FLENDER", model:"Z108-M160L4" },
+  { code:"331.FN110(Fr.B.)", description:"ID fan free bearing", assetId:"30990151", assetClass:"Circulating System", lubricant:"MOBIL DTE 26", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"331.FN110(Fx.B.)", description:"ID fan fixed bearing", assetId:"30990150", assetClass:"Circulating System", lubricant:"MOBIL DTE 26", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"331.FN400", description:"Main EP Fan Gear drive", assetId:"30771739", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"H1SH13-3,96-FC" },
+  { code:"R2.332.FN110(Fr.B.)", description:"ID fan free Bearing L#2", assetId:"40104887", assetClass:"Circulating System", lubricant:"MOBIL DTE OIL HEAVY MEDIUM", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.332.FN110(Fx.B.)", description:"ID fan fixed Bearing L#2", assetId:"40104889", assetClass:"Circulating System", lubricant:"MOBIL DTE OIL HEAVY MEDIUM", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"332.FN400", description:"Main EP Fan Gear drive L#2", assetId:"40109781", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"H1SH13-3,96-FC" },
+  { code:"R2.322.FN400(Fr.B)", description:"Final fan free bearings", assetId:"52183168", assetClass:"Circulating System", lubricant:"MOBIL DTE OIL HEAVY MEDIUM", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.322.FN400(Fx.B)", description:"Final fan fixed bearings", assetId:"52183173", assetClass:"Circulating System", lubricant:"MOBIL DTE OIL HEAVY MEDIUM", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"341.BE040 L", description:"Bucket Elevator GB - L", assetId:"51526791", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"341.BE040 R", description:"Bucket Elevator GB - R", assetId:"51526792", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"342.BE050 L", description:"Bucket Elevator GB - L", assetId:"51526794", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"342.BE050 R", description:"Bucket Elevator GB - R", assetId:"51526793", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"351.BE350 L", description:"Bucket Elevator GB - L", assetId:"51526790", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"351.BE350 R", description:"Bucket Elevator GB - R", assetId:"51526789", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"352.BE340 L", description:"Bucket Elevator GB - L", assetId:"51526802", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"352.BE340 R", description:"Bucket Elevator GB - R", assetId:"51526804", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"421.FV770", description:"AF sluice FLS Hyd. unit", assetId:"40603951", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"If needed", manufacturer:"FLS", model:"PREHEATER HOTDISK GATE HYD." },
+  { code:"421.HR700 (A)", description:"HOTDISC Drive M01", assetId:"51801026", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"If needed", manufacturer:"SEW", model:"N/A" },
+  { code:"421.HR700 (B)", description:"HOTDISC Drive M02", assetId:"51801025", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"If needed", manufacturer:"SEW", model:"N/A" },
+  { code:"431.HT120", description:"Kiln Hydraulic thrust circuit", assetId:"30913116", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"3 Months", manufacturer:"PARKER", model:"N/A" },
+  { code:"431.HT120(BE)", description:"Hydraulic thrust bearing", assetId:"30913120", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"3 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB101(1)", description:"Kiln Bearing", assetId:"30654022", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB101(2)", description:"Kiln Bearing", assetId:"30654005", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB101(3)", description:"Kiln Bearing", assetId:"30654021", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB101(4)", description:"Kiln Bearing", assetId:"30654006", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB102(1)", description:"Kiln Bearing", assetId:"30654023", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB102(2)", description:"Kiln Bearing", assetId:"30654047", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB102(3)", description:"Kiln Bearing", assetId:"30654048", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB102(4)", description:"Kiln Bearing", assetId:"30654049", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB103(1)", description:"Kiln Bearing", assetId:"30654050", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB103(2)", description:"Kiln Bearing", assetId:"30654057", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB103(3)", description:"Kiln Bearing", assetId:"30654051", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.KB103(4)", description:"Kiln Bearing", assetId:"30654053", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"431.MD140 (N31)", description:"Kiln Main drive gearbox W.S side", assetId:"30662749", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"4 Months", manufacturer:"FLENDER", model:"H3SH20" },
+  { code:"431.MD140 (N32)", description:"Kiln Main drive gearbox CCR side", assetId:"30662750", assetClass:"Gear Drive", lubricant:"MOBIL SHC 634", interval:"4 Months", manufacturer:"FLENDER", model:"H3SH20" },
+  { code:"R2.432.HT120(T)", description:"Kiln Hydraulic thrust circuit L#2", assetId:"40110628", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"3 Months", manufacturer:"PARKER", model:"N/A" },
+  { code:"R2.432.HT120(BE)", description:"Hydraulic thrust bearing L#2", assetId:"40110626", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"3 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB101(1)", description:"Kiln Bearing", assetId:"40104806", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB101(2)", description:"Kiln Bearing", assetId:"40104814", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB101(3)", description:"Kiln Bearing", assetId:"40104815", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB101(4)", description:"Kiln Bearing", assetId:"40104816", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB102(1)", description:"Kiln Bearing", assetId:"40104834", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB102(2)", description:"Kiln Bearing", assetId:"40104823", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB102(3)", description:"Kiln Bearing", assetId:"40104824", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB102(4)", description:"Kiln Bearing", assetId:"40104821", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB103(1)", description:"Kiln Bearing", assetId:"40104820", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB103(2)", description:"Kiln Bearing", assetId:"40104827", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB103(3)", description:"Kiln Bearing", assetId:"40104829", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.KB103(4)", description:"Kiln Bearing", assetId:"40104832", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 1000", interval:"4 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"R2.432.MD140(N31)", description:"Kiln #2 Main drive gearbox (N31)", assetId:"40109809", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 460", interval:"4 Months", manufacturer:"FLENDER", model:"H3SH20" },
+  { code:"R2.432.MD140(N32)", description:"Kiln #2 Main drive gearbox (N32)", assetId:"40109808", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 460", interval:"4 Months", manufacturer:"FLENDER", model:"H3SH20" },
+  { code:"441.FN590", description:"Clinker Cooler filter Fan", assetId:"30771884", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"H1SH9-3,55-FC" },
+  { code:"441.MD140 (T)", description:"Clinker Cooler Drive L#1 (Tank)", assetId:"30920769", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"Monthly", manufacturer:"BOSCH", model:"SF 4X6F CROSS BAR COOLER" },
+  { code:"R2.442.FN590", description:"Clinker Cooler L#2 filter fan", assetId:"40104838", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"H1SH9-3,55-FC" },
+  { code:"R2.442.MD140(T)", description:"Clinker Cooler Drive L#2 (Tank)", assetId:"40047886", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"Monthly", manufacturer:"BOSCH", model:"SF 4X6F CROSS BAR COOLER" },
+  { code:"461.CP524", description:"Coal#1 - Air Compressor", assetId:"51905342", assetClass:"Hydraulic", lubricant:"MOBIL SHC RARUS 68", interval:"If needed", manufacturer:"ATLAS COPCO", model:"" },
+  { code:"461.CP525", description:"Coal#1 - Air Compressor", assetId:"51905344", assetClass:"Hydraulic", lubricant:"MOBIL SHC RARUS 68", interval:"If needed", manufacturer:"ATLAS COPCO", model:"" },
+  { code:"461.CP526", description:"Coal#1 - Air Compressor", assetId:"51905345", assetClass:"Hydraulic", lubricant:"MOBIL SHC RARUS 68", interval:"If needed", manufacturer:"ATLAS COPCO", model:"" },
+  { code:"461.HY110", description:"Coal Mill 1 Hyd. tensioning sys.", assetId:"40584341", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"Monthly", manufacturer:"FLS", model:"ATOX MILL 25 HYD. TENSION" },
+  { code:"461.LQ120(T)", description:"Coal Mill 1 Roller Lub. Unit (Tank)", assetId:"40584265", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"Monthly", manufacturer:"N/A", model:"N/A" },
+  { code:"461.LQ145", description:"Coal Mill 1 Gear box", assetId:"40584264", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 320", interval:"Monthly", manufacturer:"MAAG", model:"60181, WPU-27/C ATOX 25" },
+  { code:"461.MD152", description:"Coal Mill#1 Separator Gear Box", assetId:"50841292", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 320", interval:"6 Months", manufacturer:"MAAG", model:"60181, WPU-27/C ATOX 25" },
+  { code:"462.CP525", description:"Coal#2 - Air Compressor", assetId:"51905347", assetClass:"Hydraulic", lubricant:"MOBIL SHC RARUS 68", interval:"If needed", manufacturer:"ATLAS COPCO", model:"" },
+  { code:"462.CP530", description:"Coal#2 - Air Compressor", assetId:"51905348", assetClass:"Hydraulic", lubricant:"MOBIL SHC RARUS 68", interval:"If needed", manufacturer:"ATLAS COPCO", model:"" },
+  { code:"462.CP535", description:"Coal#2 - Air Compressor", assetId:"51905349", assetClass:"Hydraulic", lubricant:"MOBIL SHC RARUS 68", interval:"If needed", manufacturer:"ATLAS COPCO", model:"" },
+  { code:"462.HY110", description:"Coal Mill 2 Hyd. tensioning sys.", assetId:"50343158", assetClass:"Hydraulic", lubricant:"MOBIL DTE 25", interval:"Monthly", manufacturer:"FLS", model:"ATOX MILL 25 HYD. TENSION" },
+  { code:"462.LQ120(T)", description:"Coal Mill 2 Roller Lub. Unit (Tank)", assetId:"50343163", assetClass:"Circulating System", lubricant:"MOBIL SHC 639", interval:"Monthly", manufacturer:"N/A", model:"N/A" },
+  { code:"462.LQ145", description:"Coal Mill 2 (T)", assetId:"50343159", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 320", interval:"Monthly", manufacturer:"MAAG", model:"60181, WPU-27/C ATOX 25" },
+  { code:"462.MD152", description:"Coal Mill 2 Separator Gear Box", assetId:"50841293", assetClass:"Circulating System", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"MAAG", model:"60181, WPU-27/C ATOX 25" },
+  { code:"471.AC100", description:"Pan Conveyor Main drive gearbox", assetId:"30662752", assetClass:"Gear Drive", lubricant:"MOBIL GLYGOYLE 220", interval:"6 Months", manufacturer:"FLENDER", model:"BA 500 EN 06.03" },
+  { code:"471.CV200", description:"Drag chain geared motor", assetId:"30958414", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"BREVINI", model:"SL 2 PLB 0 85.16 / FS / 349,3" },
+  { code:"R2.472.AC100", description:"Pan Conv. #2 Main drive gearbox", assetId:"40109824", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"FLENDER", model:"BA 500 EN 06.03" },
+  { code:"R2.472.CV200", description:"Drag Chain L#2 geared motor", assetId:"40109815", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"BREVINI", model:"SL 2 PLB 0 85.16 / FS / 349,3" },
+  { code:"481.BC600", description:"Belt conveyor Gearbox", assetId:"30958415", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"ROSSI", model:"G05 R 3I 320 UP2A / 37.4" },
+  { code:"482.BC600", description:"Belt conveyor Gearbox", assetId:"40695765", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"6 Months", manufacturer:"ROSSI", model:"G05 R 3I 320 UP2A / 37.4" },
+  { code:"531.BE220", description:"Bucket Elevator BM#1 GB.", assetId:"40695862", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"531.LQ110", description:"Cement Mill Inlet Slide Shoe Bearing LUB.", assetId:"40695763", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"531.LQ120", description:"Cement Mill Outlet Slide Shoe Bearing LUB.", assetId:"40695731", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"531.LQ145", description:"Cement Mill #1 Gear box", assetId:"40617897", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"531.LQ305", description:"Separator Shaft Lubrication Unit", assetId:"51523211", assetClass:"Circulating System", lubricant:"MOBIL VACUOLINE 528", interval:"If needed", manufacturer:"NA", model:"N/A" },
+  { code:"531.MD302", description:"Cement Mill #1 Separator GB", assetId:"50841436", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"3 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"532.BE220", description:"Bucket Elevator BM#2 GB.", assetId:"40695864", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"532.LQ110", description:"Cement Mill Inlet Slide Shoe Bearing LUB.", assetId:"40695762", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"6 Months", manufacturer:"NA", model:"NA" },
+  { code:"532.LQ120", description:"Cement Mill Outlet Slide Shoe Bearing LUB.", assetId:"40695738", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"532.LQ145", description:"Cement Mill #2 Gear box", assetId:"40695787", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"532.LQ305", description:"Separator Shaft Lubrication Unit", assetId:"51523212", assetClass:"Circulating System", lubricant:"MOBIL VACUOLINE 528", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"532.MD302", description:"Cement Mill #2 separator Gear box", assetId:"50641427", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"3 Months", manufacturer:"NA", model:"N/A" },
+  { code:"533.BE220", description:"Bucket Elevator BM#3 GB.", assetId:"51562415", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"533.LQ110", description:"Cement Mill Inlet Slide Shoe Bearing LUB.", assetId:"40695759", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"6 Months", manufacturer:"NA", model:"NA" },
+  { code:"533.LQ120", description:"Cement Mill Outlet Slide Shoe Bearing LUB.", assetId:"40695741", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"533.LQ145", description:"Cement Mill #3 Gear box", assetId:"40695795", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"533.MD302", description:"Cement Mill #3 Separator Gear box", assetId:"50841294", assetClass:"Gear Drive", lubricant:"MOBIL SHC 630", interval:"Monthly", manufacturer:"N/A", model:"N/A" },
+  { code:"534.BE220", description:"Bucket Elevator BM#4 GB.", assetId:"51562416", assetClass:"Gear Drive", lubricant:"MOBILGEAR 600 XP 320", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"534.LQ110", description:"Cement Mill Outlet Slide Shoe Bearing LUB.", assetId:"31021830", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"6 Months", manufacturer:"NA", model:"NA" },
+  { code:"534.LQ120", description:"Cement Mill Inlet Slide Shoe Bearing LUB.", assetId:"31021831", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"534.LQ145 - Gearbox", description:"Cement Mill #4 Girth Gear", assetId:"40695800", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"534.LQ145 - Girth Gear", description:"Cement Mill #4 Gear box", assetId:"51856783", assetClass:"Circulating System", lubricant:"MOBILGEAR 600 XP 460", interval:"Monthly", manufacturer:"NA", model:"NA" },
+  { code:"534.MD302", description:"Cement Mill #4 Separator GB", assetId:"50841459", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"N/A", model:"N/A" },
+  { code:"541.BE180", description:"Bucket Elevator Cem. Silo#1 GB.", assetId:"51562433", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"542.BE180", description:"Bucket Elevator Cem. Silo#2 GB.", assetId:"51562423", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"543.BE180", description:"Bucket Elevator Cem. Silo#3 GB.", assetId:"51562425", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+  { code:"544.BE180", description:"Bucket Elevator Cem. Silo#4 GB.", assetId:"51562429", assetClass:"Gear Drive", lubricant:"MOBIL SHC 632", interval:"6 Months", manufacturer:"FLENDER", model:"N/A" },
+];
+
+
+// ─── Styles ──────────────────────────────────────────────────────────────────
+// ─── Theme system ──────────────────────────────────────────────────────────────
+const THEMES = {
+  "Navy Dark": {
+    appBg:"#0A1628", sidebarBg:"#0D1E35", cardBg:"#0D1E35", topbarBg:"#0D1E35",
+    border:"#1E3A5F", border2:"#1A2E45", inputBg:"#0A1628", metricBg:"#0A1628",
+    textPrimary:"#E8F4FD", textSecondary:"#6B8CAE", textMuted:"#3A5068",
+    textHighlight:"#C8DFF0", textSubtle:"#8BAFC8",
+    accent:"#00B4D8", accentText:"#0A1628", navActive:"rgba(0,180,216,0.1)",
+    tableHead:"#0A1628", tableRow:"#0D1E35", tableRowAlt:"#0A1A2E", tableHover:"rgba(0,180,216,0.06)",
+    scrollThumb:"#1E3A5F", cardSubBg:"#0A1628", infoBarBg:"#0A1A2E",
+    codeBg:"#060E1A", codeText:"#6BCF9E",
+    danger:"#E63946", warning:"#F4A261", success:"#2DC653", info:"#00B4D8",
+    dangerBg:"#3A1A1A", warningBg:"#2A1800", successBg:"#0A2A12",
+    pillDanger:"rgba(230,57,70,0.15)", pillWarning:"rgba(244,162,97,0.15)", pillSuccess:"rgba(45,198,83,0.15)", pillInfo:"rgba(0,180,216,0.15)",
+  },
+  "Midnight Blue": {
+    appBg:"#0D0F1A", sidebarBg:"#12152B", cardBg:"#12152B", topbarBg:"#12152B",
+    border:"#252A4A", border2:"#1C2040", inputBg:"#0D0F1A", metricBg:"#0D0F1A",
+    textPrimary:"#E6E8FF", textSecondary:"#7B82C0", textMuted:"#3A4070",
+    textHighlight:"#C8CAFF", textSubtle:"#9B9ED0",
+    accent:"#7C6FE6", accentText:"#FFF", navActive:"rgba(124,111,230,0.12)",
+    tableHead:"#0D0F1A", tableRow:"#12152B", tableRowAlt:"#0F1222", tableHover:"rgba(124,111,230,0.08)",
+    scrollThumb:"#252A4A", cardSubBg:"#0D0F1A", infoBarBg:"#0F1228",
+    codeBg:"#080A14", codeText:"#A78BFA",
+    danger:"#F0657A", warning:"#F4A261", success:"#4ADE80", info:"#60A5FA",
+    dangerBg:"#2A0F18", warningBg:"#201000", successBg:"#0A2018",
+    pillDanger:"rgba(240,101,122,0.15)", pillWarning:"rgba(244,162,97,0.15)", pillSuccess:"rgba(74,222,128,0.15)", pillInfo:"rgba(96,165,250,0.15)",
+  },
+  "Forest Green": {
+    appBg:"#0A1A12", sidebarBg:"#0D2019", cardBg:"#0D2019", topbarBg:"#0D2019",
+    border:"#1A3A28", border2:"#152E20", inputBg:"#0A1A12", metricBg:"#0A1A12",
+    textPrimary:"#E8F5EE", textSecondary:"#5A9A70", textMuted:"#2A5A3A",
+    textHighlight:"#C0E8D0", textSubtle:"#80B890",
+    accent:"#2DC653", accentText:"#0A1A12", navActive:"rgba(45,198,83,0.1)",
+    tableHead:"#0A1A12", tableRow:"#0D2019", tableRowAlt:"#0A1A12", tableHover:"rgba(45,198,83,0.07)",
+    scrollThumb:"#1A3A28", cardSubBg:"#0A1A12", infoBarBg:"#0A1E14",
+    codeBg:"#060F09", codeText:"#6BCF9E",
+    danger:"#F05050", warning:"#E8A030", success:"#2DC653", info:"#40C0A0",
+    dangerBg:"#2A0A0A", warningBg:"#1E1200", successBg:"#0A2A12",
+    pillDanger:"rgba(240,80,80,0.15)", pillWarning:"rgba(232,160,48,0.15)", pillSuccess:"rgba(45,198,83,0.15)", pillInfo:"rgba(64,192,160,0.15)",
+  },
+  "Slate Light": {
+    appBg:"#EEF2F6", sidebarBg:"#FFFFFF", cardBg:"#FFFFFF", topbarBg:"#FFFFFF",
+    border:"#CBD8E4", border2:"#DDE8F0", inputBg:"#F5F8FA", metricBg:"#F5F8FA",
+    textPrimary:"#0F1E2D", textSecondary:"#3D5470", textMuted:"#64748B",
+    textHighlight:"#0F172A", textSubtle:"#334155",
+    accent:"#0078A0", accentText:"#FFFFFF", navActive:"rgba(0,120,160,0.09)",
+    tableHead:"#E8EEF4", tableRow:"#FFFFFF", tableRowAlt:"#F4F8FB", tableHover:"rgba(0,120,160,0.06)",
+    scrollThumb:"#B8C8D8", cardSubBg:"#F0F6FA", infoBarBg:"#E8F4FA",
+    codeBg:"#E4EEF6", codeText:"#005070",
+    danger:"#C0292F", warning:"#A05000", success:"#186A30", info:"#005080",
+    dangerBg:"#FDE8E8", warningBg:"#FDF0E0", successBg:"#E8F8EE",
+    pillDanger:"rgba(192,41,47,0.12)", pillWarning:"rgba(160,80,0,0.12)", pillSuccess:"rgba(24,106,48,0.12)", pillInfo:"rgba(0,80,128,0.12)",
+  },
+  "Warm Sand": {
+    appBg:"#F0EBE0", sidebarBg:"#FDF7EE", cardBg:"#FDF7EE", topbarBg:"#FDF7EE",
+    border:"#CEC0A0", border2:"#DED0B0", inputBg:"#FDF7EE", metricBg:"#F8F2E8",
+    textPrimary:"#1E1008", textSecondary:"#60400A", textMuted:"#78501A",
+    textHighlight:"#1A0E00", textSubtle:"#4A2800",
+    accent:"#B06010", accentText:"#FFFFFF", navActive:"rgba(176,96,16,0.1)",
+    tableHead:"#EDE6D8", tableRow:"#FDF7EE", tableRowAlt:"#F5EEE0", tableHover:"rgba(176,96,16,0.06)",
+    scrollThumb:"#BEA870", cardSubBg:"#F5EEE0", infoBarBg:"#EDE6D4",
+    codeBg:"#E8E0D0", codeText:"#703800",
+    danger:"#B02020", warning:"#906000", success:"#206020", info:"#205080",
+    dangerBg:"#FBEAEA", warningBg:"#FBF0DC", successBg:"#E8F4E8",
+    pillDanger:"rgba(176,32,32,0.12)", pillWarning:"rgba(144,96,0,0.12)", pillSuccess:"rgba(32,96,32,0.12)", pillInfo:"rgba(32,80,128,0.12)",
+  },
+  "Pearl White": {
+    appBg:"#F7F8FA", sidebarBg:"#FFFFFF", cardBg:"#FFFFFF", topbarBg:"#FFFFFF",
+    border:"#E2E8F0", border2:"#EDF2F7", inputBg:"#F7F8FA", metricBg:"#F7F8FA",
+    textPrimary:"#0F172A", textSecondary:"#475569", textMuted:"#64748B",
+    textHighlight:"#0F172A", textSubtle:"#1E293B",
+    accent:"#2563EB", accentText:"#FFFFFF", navActive:"rgba(37,99,235,0.08)",
+    tableHead:"#F1F5F9", tableRow:"#FFFFFF", tableRowAlt:"#F8FAFC", tableHover:"rgba(37,99,235,0.04)",
+    scrollThumb:"#CBD5E1", cardSubBg:"#F1F5F9", infoBarBg:"#EFF6FF",
+    codeBg:"#E8F0FE", codeText:"#1D4ED8",
+    danger:"#DC2626", warning:"#D97706", success:"#16A34A", info:"#2563EB",
+    dangerBg:"#FEF2F2", warningBg:"#FFFBEB", successBg:"#F0FDF4",
+    pillDanger:"rgba(220,38,38,0.1)", pillWarning:"rgba(217,119,6,0.1)", pillSuccess:"rgba(22,163,74,0.1)", pillInfo:"rgba(37,99,235,0.1)",
+  },
+  "Sky Blue": {
+    appBg:"#EFF6FF", sidebarBg:"#DBEAFE", cardBg:"#FFFFFF", topbarBg:"#FFFFFF",
+    border:"#BFDBFE", border2:"#DBEAFE", inputBg:"#F0F9FF", metricBg:"#F0F9FF",
+    textPrimary:"#1E3A5F", textSecondary:"#3B6EA5", textMuted:"#3B6EA5",
+    textHighlight:"#0D1E35", textSubtle:"#1E3A5F",
+    accent:"#0369A1", accentText:"#FFFFFF", navActive:"rgba(3,105,161,0.1)",
+    tableHead:"#EFF6FF", tableRow:"#FFFFFF", tableRowAlt:"#F0F9FF", tableHover:"rgba(3,105,161,0.05)",
+    scrollThumb:"#93C5FD", cardSubBg:"#F0F9FF", infoBarBg:"#E0F2FE",
+    codeBg:"#E0F2FE", codeText:"#0C4A6E",
+    danger:"#B91C1C", warning:"#B45309", success:"#15803D", info:"#0369A1",
+    dangerBg:"#FEF2F2", warningBg:"#FFFBEB", successBg:"#F0FDF4",
+    pillDanger:"rgba(185,28,28,0.1)", pillWarning:"rgba(180,83,9,0.1)", pillSuccess:"rgba(21,128,61,0.1)", pillInfo:"rgba(3,105,161,0.1)",
+  },
+  "Rose Light": {
+    appBg:"#FFF1F2", sidebarBg:"#FFFFFF", cardBg:"#FFFFFF", topbarBg:"#FFFFFF",
+    border:"#FECDD3", border2:"#FFE4E6", inputBg:"#FFF5F5", metricBg:"#FFF5F5",
+    textPrimary:"#3B0A14", textSecondary:"#9F3040", textMuted:"#9F3040",
+    textHighlight:"#1A0008", textSubtle:"#6B1025",
+    accent:"#BE123C", accentText:"#FFFFFF", navActive:"rgba(190,18,60,0.08)",
+    tableHead:"#FFF1F2", tableRow:"#FFFFFF", tableRowAlt:"#FFF5F5", tableHover:"rgba(190,18,60,0.04)",
+    scrollThumb:"#FDA4AF", cardSubBg:"#FFF5F5", infoBarBg:"#FFF1F2",
+    codeBg:"#FFE4E6", codeText:"#9F1239",
+    danger:"#BE123C", warning:"#B45309", success:"#15803D", info:"#0369A1",
+    dangerBg:"#FFF1F2", warningBg:"#FFFBEB", successBg:"#F0FDF4",
+    pillDanger:"rgba(190,18,60,0.12)", pillWarning:"rgba(180,83,9,0.1)", pillSuccess:"rgba(21,128,61,0.1)", pillInfo:"rgba(3,105,161,0.1)",
+  },
+  "Mint Fresh": {
+    appBg:"#F0FDF4", sidebarBg:"#FFFFFF", cardBg:"#FFFFFF", topbarBg:"#FFFFFF",
+    border:"#BBF7D0", border2:"#DCFCE7", inputBg:"#F0FDF4", metricBg:"#F0FDF4",
+    textPrimary:"#052E16", textSecondary:"#166534", textMuted:"#166534",
+    textHighlight:"#052E16", textSubtle:"#14532D",
+    accent:"#15803D", accentText:"#FFFFFF", navActive:"rgba(21,128,61,0.09)",
+    tableHead:"#F0FDF4", tableRow:"#FFFFFF", tableRowAlt:"#F7FFF9", tableHover:"rgba(21,128,61,0.05)",
+    scrollThumb:"#86EFAC", cardSubBg:"#ECFDF5", infoBarBg:"#DCFCE7",
+    codeBg:"#DCFCE7", codeText:"#14532D",
+    danger:"#B91C1C", warning:"#B45309", success:"#15803D", info:"#0369A1",
+    dangerBg:"#FEF2F2", warningBg:"#FFFBEB", successBg:"#DCFCE7",
+    pillDanger:"rgba(185,28,28,0.1)", pillWarning:"rgba(180,83,9,0.1)", pillSuccess:"rgba(21,128,61,0.12)", pillInfo:"rgba(3,105,161,0.1)",
+  },
+  "Carbon Dark": {
+    appBg:"#111111", sidebarBg:"#1C1C1C", cardBg:"#1C1C1C", topbarBg:"#1C1C1C",
+    border:"#303030", border2:"#282828", inputBg:"#111111", metricBg:"#111111",
+    textPrimary:"#F2F2F2", textSecondary:"#A0A0A0", textMuted:"#606060",
+    textHighlight:"#FFFFFF", textSubtle:"#C0C0C0",
+    accent:"#E63946", accentText:"#FFFFFF", navActive:"rgba(230,57,70,0.1)",
+    tableHead:"#111111", tableRow:"#1C1C1C", tableRowAlt:"#181818", tableHover:"rgba(230,57,70,0.07)",
+    scrollThumb:"#383838", cardSubBg:"#141414", infoBarBg:"#181818",
+    codeBg:"#0A0A0A", codeText:"#FF8090",
+    danger:"#E63946", warning:"#F4A261", success:"#2DC653", info:"#60C0E0",
+    dangerBg:"#2A0808", warningBg:"#201000", successBg:"#082008",
+    pillDanger:"rgba(230,57,70,0.18)", pillWarning:"rgba(244,162,97,0.15)", pillSuccess:"rgba(45,198,83,0.15)", pillInfo:"rgba(96,192,224,0.15)",
+  },
+};
+
+// Global theme state — updated by App, read by all components via S()
+let _theme = THEMES["Navy Dark"];
+function setGlobalTheme(t) { _theme = t; }
+
+// S is a Proxy — S.card, S.btn etc. read from _theme at access time, so all
+// components automatically reflect the current theme without any prop drilling.
+const S = new Proxy({}, {
+  get(_, key) {
+    const T = _theme;
+    const map = {
+      app:          { display:"flex", height:"100vh", fontFamily:"'Inter',sans-serif", background:T.appBg, color:T.textPrimary, overflow:"hidden", position:"relative" },
+      sidebar:      { width:220, background:T.sidebarBg, borderRight:`1px solid ${T.border}`, display:"flex", flexDirection:"column", flexShrink:0 },
+      logo:         { padding:"16px 16px 14px", borderBottom:`1px solid ${T.border}` },
+      logoTitle:    { fontSize:14, fontWeight:700, color:T.accent, letterSpacing:1, margin:0 },
+      logoSub:      { fontSize:11, color:T.textSecondary, margin:"2px 0 0" },
+      nav:          { flex:1, padding:"12px 0" },
+      navItem:      (active) => ({ display:"flex", alignItems:"center", gap:10, padding:"10px 20px", cursor:"pointer", fontSize:13, fontWeight:active?600:400, color:active?T.accent:T.textSecondary, background:active?T.navActive:"transparent", borderLeft:active?`3px solid ${T.accent}`:"3px solid transparent", transition:"all 0.15s" }),
+      main:         { flex:1, display:"flex", flexDirection:"column", overflow:"hidden" },
+      topbar:       { padding:"14px 24px", background:T.topbarBg, borderBottom:`1px solid ${T.border}`, display:"flex", alignItems:"center", justifyContent:"space-between" },
+      content:      { flex:1, overflowY:"auto", padding:24, background:T.appBg },
+      card:         { background:T.cardBg, border:`1px solid ${T.border}`, borderRadius:10, padding:20, marginBottom:16 },
+      badge:        (status) => ({ display:"inline-block", padding:"2px 10px", borderRadius:20, fontSize:11, fontWeight:700, background:STATUS_COLORS[status]?.bg||"#444", color:STATUS_COLORS[status]?.text||"#fff" }),
+      actionBadge:  (status) => ({ display:"inline-block", padding:"2px 10px", borderRadius:20, fontSize:11, fontWeight:600, background:ACTION_STATUS_COLORS[status]?.bg||"#444", color:ACTION_STATUS_COLORS[status]?.text||"#fff" }),
+      btn:          { padding:"8px 16px", borderRadius:6, border:`1px solid ${T.border}`, background:T.border, color:T.textPrimary, cursor:"pointer", fontSize:13, fontWeight:500 },
+      btnPrimary:   { padding:"8px 16px", borderRadius:6, border:"none", background:T.accent, color:T.accentText, cursor:"pointer", fontSize:13, fontWeight:700 },
+      input:        { padding:"8px 12px", borderRadius:6, border:`1px solid ${T.border}`, background:T.inputBg, color:T.textPrimary, fontSize:13, outline:"none", width:"100%", boxSizing:"border-box" },
+      select:       { padding:"8px 12px", borderRadius:6, border:`1px solid ${T.border}`, background:T.inputBg, color:T.textPrimary, fontSize:13, outline:"none", cursor:"pointer" },
+      table:        { width:"100%", borderCollapse:"collapse", fontSize:13 },
+      th:           { textAlign:"left", padding:"10px 12px", background:T.tableHead, color:T.textSecondary, fontWeight:600, fontSize:12, letterSpacing:0.5, borderBottom:`1px solid ${T.border}` },
+      td:           { padding:"10px 12px", borderBottom:`1px solid ${T.border2}`, color:T.textPrimary },
+      metricCard:   { background:T.metricBg, border:`1px solid ${T.border}`, borderRadius:8, padding:"16px 20px", flex:1 },
+      sectionTitle: { fontSize:16, fontWeight:700, color:T.textPrimary, margin:"0 0 16px" },
+      label:        { fontSize:12, color:T.textSecondary, marginBottom:6, display:"block" },
+      alertPulse:   { display:"inline-block", width:10, height:10, borderRadius:"50%", background:"#E63946", marginRight:6, animation:"pulse 1.5s ease-in-out infinite" },
+      T,
+    };
+    return map[key];
+  }
+});
+
+// ─── Mini sparkline chart ─────────────────────────────────────────────────────
+function Sparkline({ data, color = S.T.accent, label }) {
+  const w = 120, h = 40;
+  if (!data || data.length < 2) return null;
+  const vals = data.map(d => d.value);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const range = max - min || 1;
+  const pts = data.map((d, i) => {
+    const x = (i / (data.length - 1)) * w;
+    const y = h - ((d.value - min) / range) * (h - 8) - 4;
+    return `${x},${y}`;
+  }).join(" ");
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <svg width={w} height={h} style={{ flexShrink: 0 }}>
+        <polyline points={pts} fill="none" stroke={color} strokeWidth={2} />
+        {data.map((d, i) => {
+          const x = (i / (data.length - 1)) * w;
+          const y = h - ((d.value - min) / range) * (h - 8) - 4;
+          return <circle key={i} cx={x} cy={y} r={3} fill={color} />;
+        })}
+      </svg>
+      {label && <span style={{ fontSize: 11, color: S.T.textSecondary }}>{label}</span>}
+    </div>
+  );
+}
+
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+function Dashboard({ samples, actions, oilChanges }) {
+  const [statusFilter, setStatusFilter] = useState("All");
+
+  // Group latest sample per equipment
+  const byEquip = {};
+  samples.forEach(s => {
+    if (!byEquip[s.unitId] || new Date(s.sampledDate) > new Date(byEquip[s.unitId].sampledDate))
+      byEquip[s.unitId] = s;
+  });
+  const latestPerEquip = Object.values(byEquip);
+
+  const counts = {
+    Normal:  latestPerEquip.filter(s => s.reportStatus === "Normal").length,
+    Caution: latestPerEquip.filter(s => s.reportStatus === "Caution" || s.reportStatus === "Warning").length,
+    Alert:   latestPerEquip.filter(s => s.reportStatus === "Alert").length,
+  };
+  const totalWithSamples = latestPerEquip.length;
+  const openActions   = actions.filter(a => a.status === "Open").length;
+  const inProgress    = actions.filter(a => a.status === "In Progress").length;
+  const overdueChanges = (oilChanges||[]).filter(c => c.nextDueDate && new Date(c.nextDueDate) < new Date()).length;
+
+  // Filtered list for bottom table
+  const displaySamples = statusFilter === "All"
+    ? latestPerEquip
+    : latestPerEquip.filter(s => statusFilter === "Caution"
+        ? (s.reportStatus === "Caution" || s.reportStatus === "Warning")
+        : s.reportStatus === statusFilter);
+
+  // Recent activity — last 8 samples added
+  const recentActivity = [...samples]
+    .sort((a,b) => new Date(b.sampledDate||0) - new Date(a.sampledDate||0))
+    .slice(0, 8);
+
+  const statusCol = s => s === "Alert" ? S.T.danger : (s === "Caution" || s === "Warning") ? S.T.warning : s === "Normal" ? S.T.success : S.T.textSecondary;
+
+  // Donut arc helper
+  const total = counts.Normal + counts.Caution + counts.Alert || 1;
+  function arc(startPct, pct, r, cx, cy) {
+    if (pct <= 0) return "";
+    const start = startPct * 2 * Math.PI - Math.PI/2;
+    const end = (startPct + pct) * 2 * Math.PI - Math.PI/2;
+    const x1 = cx + r * Math.cos(start), y1 = cy + r * Math.sin(start);
+    const x2 = cx + r * Math.cos(end),   y2 = cy + r * Math.sin(end);
+    const lg = pct > 0.5 ? 1 : 0;
+    return `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${lg} 1 ${x2} ${y2} Z`;
+  }
+  const nPct = counts.Normal/total, cPct = counts.Caution/total, aPct = counts.Alert/total;
+
+  return (
+    <div>
+      <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
+      <p style={S.sectionTitle}>Dashboard</p>
+
+      {/* Top metric row */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))", gap:12, marginBottom:20 }}>
+        {[
+          { label:"Registered Equipment", value:EQUIPMENT_REGISTRY.length, icon:"ti-database",  color:S.T.accent },
+          { label:"Total Samples",         value:samples.length,            icon:"ti-flask",      color:S.T.accent },
+          { label:"Open Actions",           value:openActions,               icon:"ti-alert-circle", color:S.T.danger },
+          { label:"In Progress",            value:inProgress,                icon:"ti-loader",     color:S.T.warning },
+          { label:"Overdue Oil Changes",    value:overdueChanges,            icon:"ti-oil",        color:S.T.danger },
+        ].map(m => (
+          <div key={m.label} style={{ ...S.metricCard }}>
+            <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom:6 }}>
+              <i className={`ti ${m.icon}`} style={{ color:m.color, fontSize:18 }} aria-hidden />
+              <span style={{ fontSize:11, color:S.T.textSecondary, lineHeight:1.3 }}>{m.label}</span>
+            </div>
+            <div style={{ fontSize:28, fontWeight:800, color:m.color }}>{m.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Status breakdown + donut */}
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, marginBottom:20 }}>
+
+        {/* Donut chart */}
+        <div style={{ ...S.card, display:"flex", alignItems:"center", gap:20, flexWrap:"wrap" }}>
+          <svg width="120" height="120" viewBox="0 0 120 120">
+            {total > 0 && <>
+              <path d={arc(0, nPct, 54, 60, 60)} fill={S.T.success} opacity="0.9"/>
+              <path d={arc(nPct, cPct, 54, 60, 60)} fill={S.T.warning} opacity="0.9"/>
+              <path d={arc(nPct+cPct, aPct, 54, 60, 60)} fill={S.T.danger} opacity="0.9"/>
+              <circle cx="60" cy="60" r="34" fill={S.T.cardBg}/>
+            </>}
+            <text x="60" y="56" textAnchor="middle" fontSize="18" fontWeight="800" fill={S.T.textPrimary}>{totalWithSamples}</text>
+            <text x="60" y="70" textAnchor="middle" fontSize="9" fill={S.T.textSecondary}>equipment</text>
+          </svg>
+          <div style={{ flex:1 }}>
+            <div style={{ fontSize:13, fontWeight:600, color:S.T.textPrimary, marginBottom:10 }}>Equipment Status</div>
+            {[
+              { label:"Normal",  count:counts.Normal,  color:S.T.success, status:"Normal" },
+              { label:"Caution", count:counts.Caution, color:S.T.warning, status:"Caution" },
+              { label:"Alert",   count:counts.Alert,   color:S.T.danger,  status:"Alert" },
+            ].map(r => (
+              <div key={r.label} onClick={() => setStatusFilter(statusFilter===r.status?"All":r.status)}
+                style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8, cursor:"pointer",
+                  opacity: statusFilter!=="All" && statusFilter!==r.status ? 0.4 : 1 }}>
+                <div style={{ width:10, height:10, borderRadius:"50%", background:r.color, flexShrink:0 }}/>
+                <div style={{ flex:1, height:8, borderRadius:4, background:S.T.border, overflow:"hidden" }}>
+                  <div style={{ width:`${total?r.count/total*100:0}%`, height:"100%", background:r.color, borderRadius:4 }}/>
+                </div>
+                <span style={{ fontSize:12, fontWeight:700, color:r.color, minWidth:20 }}>{r.count}</span>
+                <span style={{ fontSize:11, color:S.T.textSecondary }}>{r.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Action summary */}
+        <div style={{ ...S.card }}>
+          <div style={{ fontSize:13, fontWeight:600, color:S.T.textPrimary, marginBottom:12 }}>Action Tracker Summary</div>
+          {[
+            { label:"Open",              value:actions.filter(a=>a.status==="Open").length,              color:S.T.danger },
+            { label:"In Progress",       value:actions.filter(a=>a.status==="In Progress").length,       color:S.T.warning },
+            { label:"Waiting Stoppage",  value:actions.filter(a=>a.status==="Waiting Stoppage").length,  color:S.T.accent },
+            { label:"Closed",            value:actions.filter(a=>a.status==="Closed").length,            color:S.T.success },
+          ].map(r => (
+            <div key={r.label} style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
+              padding:"8px 0", borderBottom:`1px solid ${S.T.border2}` }}>
+              <span style={{ fontSize:12, color:S.T.textSecondary }}>{r.label}</span>
+              <span style={{ fontSize:14, fontWeight:700, color:r.color }}>{r.value}</span>
+            </div>
+          ))}
+          <div style={{ display:"flex", justifyContent:"space-between", padding:"8px 0", marginTop:2 }}>
+            <span style={{ fontSize:12, fontWeight:600, color:S.T.textPrimary }}>Total</span>
+            <span style={{ fontSize:14, fontWeight:800, color:S.T.textPrimary }}>{actions.length}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Equipment status table with filter */}
+      <div style={{ ...S.card, padding:0 }}>
+        <div style={{ padding:"12px 16px", borderBottom:`1px solid ${S.T.border}`, display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:8 }}>
+          <span style={{ fontWeight:600, color:S.T.textPrimary, fontSize:13 }}>Equipment Status — Latest Sample</span>
+          <div style={{ display:"flex", gap:6 }}>
+            {["All","Normal","Caution","Alert"].map(f => (
+              <button key={f} onClick={() => setStatusFilter(f)}
+                style={{ ...S.btn, fontSize:11, padding:"3px 10px",
+                  background: statusFilter===f ? (f==="Alert"?S.T.danger:f==="Caution"?S.T.warning:f==="Normal"?S.T.success:S.T.border) : "transparent",
+                  color: statusFilter===f ? (f==="All"?S.T.textPrimary:"#fff") : S.T.textSecondary,
+                  border:`1px solid ${statusFilter===f?(f==="Alert"?S.T.danger:f==="Caution"?S.T.warning:f==="Normal"?S.T.success:S.T.border):S.T.border}` }}>
+                {f} {f!=="All" && `(${counts[f]||0})`}
+              </button>
+            ))}
+          </div>
+        </div>
+        {displaySamples.length === 0 ? (
+          <div style={{ padding:32, textAlign:"center", color:S.T.textMuted, fontSize:13 }}>
+            No {statusFilter !== "All" ? statusFilter : ""} samples recorded yet.
+          </div>
+        ) : (
+          <div style={{ overflowX:"auto" }}>
+            <table style={S.table}>
+              <thead>
+                <tr>
+                  {["Equipment ID","Description","Sample Date","Status","Equipment Rating","Lubricant Rating","Contamination"].map(h => (
+                    <th key={h} style={S.th}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {displaySamples.sort((a,b) => {
+                  const order = {Alert:0,Caution:1,Warning:1,Normal:2};
+                  return (order[a.reportStatus]??3) - (order[b.reportStatus]??3);
+                }).map((s, i) => (
+                  <tr key={i}>
+                    <td style={S.td}>
+                      {(s.reportStatus==="Alert") && <span style={S.alertPulse}/>}
+                      <span style={{ fontWeight:600, color:S.T.accent }}>{s.unitId}</span>
+                    </td>
+                    <td style={{ ...S.td, maxWidth:180, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{s.description}</td>
+                    <td style={S.td}>{fmtDate(s.sampledDate)}</td>
+                    <td style={S.td}><span style={S.badge(s.reportStatus)}>{s.reportStatus}</span></td>
+                    <td style={S.td}><span style={S.badge(s.equipmentRating)}>{s.equipmentRating||"—"}</span></td>
+                    <td style={S.td}><span style={S.badge(s.lubricantRating)}>{s.lubricantRating||"—"}</span></td>
+                    <td style={S.td}><span style={S.badge(s.contaminationRating)}>{s.contaminationRating||"—"}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Recent activity */}
+      {recentActivity.length > 0 && (
+        <div style={{ ...S.card, marginTop:16 }}>
+          <div style={{ fontSize:13, fontWeight:600, color:S.T.textPrimary, marginBottom:10 }}>Recent Samples Added</div>
+          <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+            {recentActivity.map((s,i) => (
+              <div key={i} style={{ display:"flex", alignItems:"center", gap:10, padding:"6px 0", borderBottom:`1px solid ${S.T.border2}` }}>
+                <span style={{ width:8, height:8, borderRadius:"50%", background:statusCol(s.reportStatus), flexShrink:0 }}/>
+                <span style={{ fontSize:12, fontWeight:600, color:S.T.accent, minWidth:140 }}>{s.unitId}</span>
+                <span style={{ fontSize:11, color:S.T.textSecondary, flex:1 }}>{fmtDate(s.sampledDate)}</span>
+                <span style={S.badge(s.reportStatus)}>{s.reportStatus}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Sample Report View ───────────────────────────────────────────────────────
+function SampleReport({ sample, actions, oilChanges, onAddAction, onUpdateAction }) {
+  // Find last oil change for this equipment
+  const lastOilChange = (oilChanges || [])
+    .filter(c => c.equipmentCode === sample.unitId && c.changeDate)
+    .sort((a,b) => new Date(b.changeDate) - new Date(a.changeDate))[0];
+
+  const wearItems = sample.wear || {};
+  const wearLabels = Object.keys(wearItems);
+  const wearVals = Object.values(wearItems);
+
+  const addItems = sample.additives || {};
+
+  return (
+    <div>
+      <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
+      <div style={{ ...S.card, borderTop: `4px solid ${STATUS_COLORS[sample.reportStatus]?.bg || "#444"}` }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              {sample.reportStatus === "Alert" && <span style={S.alertPulse} />}
+              <span style={{ fontSize: 20, fontWeight: 700, color: S.T.textPrimary }}>{sample.unitId}</span>
+              <span style={S.badge(sample.reportStatus)}>{sample.reportStatus}</span>
+            </div>
+            <div style={{ fontSize: 13, color: S.T.textSecondary, marginTop: 4 }}>{sample.description}</div>
+          </div>
+          <div style={{ textAlign: "right", fontSize: 12, color: S.T.textSecondary }}>
+            <div>Asset ID: {sample.assetId}</div>
+            <div>Sample ID: {sample.sampleId}</div>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 20 }}>
+          {[
+            { label: "Account", value: sample.accountName },
+            { label: "Lubricant", value: sample.lubricant },
+            { label: "Asset Class", value: sample.assetClass },
+            { label: "Sampled", value: fmtDate(sample.sampledDate) },
+            { label: "Reported", value: fmtDate(sample.reportedDate) },
+            { label: "Sampled By", value: sample.sampledBy },
+          ].map(f => (
+            <div key={f.label} style={{ background: S.T.appBg, borderRadius: 6, padding: "10px 14px" }}>
+              <div style={{ fontSize: 11, color: S.T.textSecondary }}>{f.label}</div>
+              <div style={{ fontSize: 13, color: S.T.textHighlight, marginTop: 2, fontWeight: 500 }}>{f.value || "—"}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Oil Change info bar */}
+        <div style={{ background: lastOilChange ? S.T.appBg : S.T.infoBarBg, border: `1px solid ${lastOilChange ? S.T.successBg : S.T.dangerBg}`, borderRadius: 8, padding: "10px 16px", marginBottom: 20, display:"flex", alignItems:"center", gap:16, flexWrap:"wrap" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+            <i className="ti ti-oil" style={{ color: lastOilChange ? S.T.success : S.T.textSecondary, fontSize:18 }} />
+            <div>
+              <div style={{ fontSize:11, color:S.T.textSecondary }}>Last Oil Change</div>
+              <div style={{ fontSize:13, fontWeight:600, color: lastOilChange ? S.T.success : S.T.danger }}>
+                {lastOilChange ? lastOilChange.changeDate : "No record found"}
+              </div>
+            </div>
+          </div>
+          {lastOilChange && (<>
+            <div>
+              <div style={{ fontSize:11, color:S.T.textSecondary }}>Oil Type / Brand</div>
+              <div style={{ fontSize:13, color:S.T.textHighlight }}>{lastOilChange.oilType || "—"} {lastOilChange.brand ? `/ ${lastOilChange.brand}` : ""}</div>
+            </div>
+            <div>
+              <div style={{ fontSize:11, color:S.T.textSecondary }}>Next Due</div>
+              <div style={{ fontSize:13, color: lastOilChange.nextDueDate && new Date(lastOilChange.nextDueDate) < new Date() ? S.T.danger : S.T.textHighlight }}>
+                {fmtDate(lastOilChange.nextDueDate)}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize:11, color:S.T.textSecondary }}>Performed By</div>
+              <div style={{ fontSize:13, color:S.T.textHighlight }}>{lastOilChange.performedBy || "—"}</div>
+            </div>
+          </>)}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 20 }}>
+          {[
+            { label: "Contamination Rating", value: sample.contaminationRating, badge: true },
+            { label: "Equipment Rating", value: sample.equipmentRating, badge: true },
+            { label: "Lubricant Rating", value: sample.lubricantRating, badge: true },
+          ].map(r => (
+            <div key={r.label} style={{ background: S.T.appBg, borderRadius: 6, padding: "10px 14px" }}>
+              <div style={{ fontSize: 11, color: S.T.textSecondary, marginBottom: 6 }}>{r.label}</div>
+              <span style={S.badge(r.value)}>{r.value || "—"}</span>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
+          <div>
+            <p style={{ fontSize: 13, fontWeight: 700, color: S.T.accent, marginBottom: 12 }}>Lubricant Properties</p>
+            <table style={S.table}>
+              <tbody>
+                {[
+                  ["ISO Code (4/6/14)", sample.isoCode],
+                  ["Particle Count >4µm", sample.particleCount4um],
+                  ["Particle Count >6µm", sample.particleCount6um],
+                  ["Particle Count >14µm", sample.particleCount14um],
+                  ["PQ Index", sample.pqIndex],
+                  ["Visc@40°C (cSt)", sample.visc40C],
+                  ["Oxidation (Ab/cm)", sample.oxidation],
+                  ["Water (Vol%)", sample.water],
+                ].map(([k, v]) => (
+                  <tr key={k}>
+                    <td style={{ ...S.td, color: S.T.textSecondary, width: "55%" }}>{k}</td>
+                    <td style={{ ...S.td, fontFamily: "monospace", color: v === null ? S.T.textMuted : S.T.textPrimary, fontWeight: 600 }}>
+                      {v ?? "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div>
+            <p style={{ fontSize: 13, fontWeight: 700, color: S.T.accent, marginBottom: 12 }}>Wear Metals (ppm)</p>
+            {wearLabels.map(k => (
+              <div key={k} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span style={{ fontSize: 12, color: S.T.textSecondary, width: 90 }}>{k} ({getWearFull(k)})</span>
+                <div style={{ flex: 1, background: S.T.appBg, borderRadius: 4, height: 12, overflow: "hidden" }}>
+                  <div style={{
+                    height: "100%", borderRadius: 4,
+                    background: wearItems[k] > 5 ? S.T.danger : S.T.accent,
+                    width: `${Math.min(100, (wearItems[k] / 20) * 100)}%`,
+                    minWidth: wearItems[k] > 0 ? 4 : 0,
+                    transition: "width 0.3s",
+                  }} />
+                </div>
+                <span style={{ fontSize: 12, fontFamily: "monospace", color: S.T.textPrimary, width: 28, textAlign: "right" }}>{wearItems[k]}</span>
+              </div>
+            ))}
+
+            <p style={{ fontSize: 13, fontWeight: 700, color: S.T.accent, marginTop: 16, marginBottom: 12 }}>Additives (ppm)</p>
+            {Object.entries(addItems).map(([k, v]) => (
+              <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid #1A2E45", fontSize: 12 }}>
+                <span style={{ color: S.T.textSecondary }}>{k} ({getAddFull(k)})</span>
+                <span style={{ fontFamily: "monospace", color: S.T.textPrimary }}>{v}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {sample.recommendations?.length > 0 && (
+          <div style={{ background: S.T.dangerBg, border: "1px solid #E63946", borderRadius: 8, padding: 16, marginBottom: 16 }}>
+            <p style={{ fontSize: 13, fontWeight: 700, color: S.T.danger, margin: "0 0 10px", display: "flex", alignItems: "center", gap: 6 }}>
+              <i className="ti ti-alert-triangle" aria-hidden /> Recommendations
+            </p>
+            {sample.recommendations.map((r, i) => (
+              <div key={i} style={{ fontSize: 13, color: S.T.warning, marginBottom: 8, lineHeight: 1.6 }}>• {r}</div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <ActionsMiniPanel equipmentCode={sample.unitId} actions={actions} onAdd={onAddAction} onUpdate={onUpdateAction} title="Last 5 Actions" limit={5} />
+    </div>
+  );
+}
+
+function getWearFull(k) {
+  return { Ag: "Silver", Al: "Aluminum", Cr: "Chromium", Cu: "Copper", Fe: "Iron", Mo: "Molybdenum", Ni: "Nickel", Pb: "Lead", Sn: "Tin" }[k] || k;
+}
+function getAddFull(k) {
+  return { B: "Boron", Ba: "Barium", Ca: "Calcium", Mg: "Magnesium", P: "Phosphorus", Zn: "Zinc" }[k] || k;
+}
+
+// ─── Sample Edit Modal ──────────────────────────────────────────────────────
+function SampleEditModal({ sample, onSave, onClose }) {
+  const [form, setForm] = useState(() => ({
+    ...sample,
+    wear: { ...(sample.wear || {}) },
+    contaminants: { ...(sample.contaminants || {}) },
+    additives: { ...(sample.additives || {}) },
+    recommendations: sample.recommendations ? [...sample.recommendations] : [],
+  }));
+
+  function set(key, val) { setForm(f => ({ ...f, [key]: val })); }
+  function setNested(group, key, val) { setForm(f => ({ ...f, [group]: { ...f[group], [key]: val } })); }
+
+  const wearKeys = ["Ag","Al","Cr","Cu","Fe","Mo","Ni","Pb","Sn"];
+  const contKeys = ["K","Na","Si"];
+  const addKeys  = ["B","Ba","Ca","Mg","P","Zn"];
+
+  const fieldStyle = { ...S.input, fontSize: 13 };
+  const lbl = (t) => <label style={{ ...S.label, fontSize:11 }}>{t}</label>;
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", zIndex:1000,
+      display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}
+      onClick={onClose}>
+      <div style={{ background:S.T.cardBg, border:`1px solid ${S.T.border}`, borderRadius:12,
+        width:"100%", maxWidth:760, maxHeight:"90vh", overflowY:"auto", padding:24 }}
+        onClick={e => e.stopPropagation()}>
+
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:18 }}>
+          <div>
+            <p style={{ margin:0, fontSize:16, fontWeight:700, color:S.T.textPrimary }}>Edit Sample — {sample.unitId}</p>
+            <p style={{ margin:"2px 0 0", fontSize:12, color:S.T.textSecondary }}>Sample ID: {sample.sampleId}</p>
+          </div>
+          <button style={{ ...S.btn, padding:"6px 10px" }} onClick={onClose}><i className="ti ti-x" aria-hidden/></button>
+        </div>
+
+        {/* Core fields */}
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))", gap:12, marginBottom:14 }}>
+          <div>{lbl("Sample Date")}<input style={fieldStyle} type="date" value={form.sampledDate?.match(/^\d{4}-\d{2}-\d{2}/) ? form.sampledDate : ""} onChange={e=>set("sampledDate", e.target.value)} /></div>
+          <div>{lbl("Report Status")}
+            <select style={{ ...fieldStyle, cursor:"pointer" }} value={form.reportStatus||"Normal"} onChange={e=>set("reportStatus", e.target.value)}>
+              {STATUS_OPTIONS.map(o => <option key={o}>{o}</option>)}
+            </select>
+          </div>
+          <div>{lbl("Equipment Rating")}
+            <select style={{ ...fieldStyle, cursor:"pointer" }} value={form.equipmentRating||"Normal"} onChange={e=>set("equipmentRating", e.target.value)}>
+              {STATUS_OPTIONS.map(o => <option key={o}>{o}</option>)}
+            </select>
+          </div>
+          <div>{lbl("Lubricant Rating")}
+            <select style={{ ...fieldStyle, cursor:"pointer" }} value={form.lubricantRating||"Normal"} onChange={e=>set("lubricantRating", e.target.value)}>
+              {STATUS_OPTIONS.map(o => <option key={o}>{o}</option>)}
+            </select>
+          </div>
+          <div>{lbl("Contamination Rating")}
+            <select style={{ ...fieldStyle, cursor:"pointer" }} value={form.contaminationRating||"Normal"} onChange={e=>set("contaminationRating", e.target.value)}>
+              {STATUS_OPTIONS.map(o => <option key={o}>{o}</option>)}
+            </select>
+          </div>
+        </div>
+
+        {/* Lubricant properties */}
+        <p style={{ fontSize:12, fontWeight:700, color:S.T.accent, margin:"10px 0 8px" }}>Lubricant Properties</p>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))", gap:12, marginBottom:14 }}>
+          {[["visc40C","Visc@40°C (cSt)"],["tan","TAN (mg KOH/g)"],["oxidation","Oxidation (Ab/cm)"],["water","Water (Vol%)"],
+            ["particleCount4um","Particle >4µm"],["particleCount6um","Particle >6µm"],["particleCount14um","Particle >14µm"],["pqIndex","PQ Index"]].map(([k,l]) => (
+            <div key={k}>{lbl(l)}<input style={fieldStyle} value={form[k]||""} onChange={e=>set(k, e.target.value)} /></div>
+          ))}
+        </div>
+
+        {/* Wear metals */}
+        <p style={{ fontSize:12, fontWeight:700, color:S.T.accent, margin:"10px 0 8px" }}>Wear Metals (ppm)</p>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(90px,1fr))", gap:12, marginBottom:14 }}>
+          {wearKeys.map(k => (
+            <div key={k}>{lbl(getWearFull(k))}<input style={fieldStyle} value={form.wear?.[k]||""} onChange={e=>setNested("wear", k, e.target.value)} /></div>
+          ))}
+        </div>
+
+        {/* Contaminants + Additives */}
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20, marginBottom:14 }}>
+          <div>
+            <p style={{ fontSize:12, fontWeight:700, color:S.T.accent, margin:"0 0 8px" }}>Contaminants (ppm)</p>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12 }}>
+              {contKeys.map(k => (
+                <div key={k}>{lbl(k)}<input style={fieldStyle} value={form.contaminants?.[k]||""} onChange={e=>setNested("contaminants", k, e.target.value)} /></div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <p style={{ fontSize:12, fontWeight:700, color:S.T.accent, margin:"0 0 8px" }}>Additives (ppm)</p>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12 }}>
+              {addKeys.map(k => (
+                <div key={k}>{lbl(k)}<input style={fieldStyle} value={form.additives?.[k]||""} onChange={e=>setNested("additives", k, e.target.value)} /></div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Recommendations */}
+        <div style={{ marginBottom:18 }}>
+          {lbl("Sample Analysis / Recommendations")}
+          <textarea style={{ width:"100%", padding:"8px 10px", fontSize:13, minHeight:60, resize:"vertical" }}
+            value={form.recommendations?.join("; ")||""}
+            onChange={e=>set("recommendations", e.target.value ? e.target.value.split(";").map(s=>s.trim()).filter(Boolean) : [])} />
+        </div>
+
+        <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
+          <button style={S.btn} onClick={onClose}>Cancel</button>
+          <button style={S.btnPrimary} onClick={() => onSave(form)}>
+            <i className="ti ti-device-floppy" aria-hidden/> Save Changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Equipment List ───────────────────────────────────────────────────────────
+const ASSET_CLASSES = ["All Classes", ...Array.from(new Set(EQUIPMENT_REGISTRY.map(e => e.assetClass))).sort()];
+const INTERVALS = ["All Intervals", ...Array.from(new Set(EQUIPMENT_REGISTRY.map(e => e.interval))).sort()];
+
+function EquipmentList({ samples, actions, oilChanges, onSelectSample, onEditSample, onDeleteSample }) {
+  const [tab, setTab] = useState("registry"); // "registry" | "samples"
+  const [codeFilter, setCodeFilter] = useState("All");
+  const [classFilter, setClassFilter] = useState("All Classes");
+  const [intervalFilter, setIntervalFilter] = useState("All Intervals");
+  const [searchText, setSearchText] = useState("");
+  const [expandedEquip, setExpandedEquip] = useState(null);
+  const [editingSample, setEditingSample] = useState(null);
+
+  // Build sample map keyed by unitId
+  const equipMap = {};
+  samples.forEach(s => {
+    if (!equipMap[s.unitId]) equipMap[s.unitId] = [];
+    equipMap[s.unitId].push(s);
+  });
+
+  // Registry filtered list
+  const registryFiltered = EQUIPMENT_REGISTRY.filter(e => {
+    const codeOk = codeFilter === "All" || e.code === codeFilter;
+    const classOk = classFilter === "All Classes" || e.assetClass === classFilter;
+    const intOk = intervalFilter === "All Intervals" || e.interval === intervalFilter;
+    const textOk = !searchText || e.code.toLowerCase().includes(searchText.toLowerCase()) || e.description.toLowerCase().includes(searchText.toLowerCase());
+    return codeOk && classOk && intOk && textOk;
+  });
+
+  // Samples filtered list
+  const samplesFiltered = Object.entries(equipMap).filter(([id]) =>
+    codeFilter === "All" || id === codeFilter
+  );
+
+  const tabStyle = (active) => ({
+    padding: "8px 20px", cursor: "pointer", fontSize: 13, fontWeight: active ? 700 : 400,
+    color: active ? S.T.accent : S.T.textSecondary,
+    borderBottom: active ? "2px solid #00B4D8" : "2px solid transparent",
+    background: "transparent", border: "none", outline: "none",
+  });
+
+  return (
+    <div>
+      <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
+
+      {/* Tabs */}
+      <div style={{ display: "flex", borderBottom: "1px solid #1E3A5F", marginBottom: 20 }}>
+        <button style={tabStyle(tab === "registry")} onClick={() => setTab("registry")}>
+          <i className="ti ti-database" aria-hidden style={{ marginRight: 6 }} />Equipment Registry ({EQUIPMENT_REGISTRY.length})
+        </button>
+        <button style={tabStyle(tab === "samples")} onClick={() => setTab("samples")}>
+          <i className="ti ti-flask" aria-hidden style={{ marginRight: 6 }} />Sample History ({Object.keys(equipMap).length} equipment)
+        </button>
+      </div>
+
+      {/* Filters row */}
+      <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ position: "relative", minWidth: 200 }}>
+          <i className="ti ti-search" style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: S.T.textSecondary, fontSize: 15 }} aria-hidden />
+          <input style={{ ...S.input, paddingLeft: 32 }} placeholder="Search code or description..." value={searchText} onChange={e => { setSearchText(e.target.value); setCodeFilter("All"); }} />
+        </div>
+
+        <select style={{ ...S.select, minWidth: 220 }} value={codeFilter} onChange={e => { setCodeFilter(e.target.value); setSearchText(""); }}>
+          <option value="All">— All Equipment —</option>
+          {EQUIPMENT_REGISTRY.map(e => (
+            <option key={e.code} value={e.code}>{e.code} — {e.description.slice(0, 35)}{e.description.length > 35 ? "…" : ""}</option>
+          ))}
+        </select>
+
+        <select style={{ ...S.select, minWidth: 160 }} value={classFilter} onChange={e => setClassFilter(e.target.value)}>
+          {ASSET_CLASSES.map(c => <option key={c}>{c}</option>)}
+        </select>
+
+        <select style={{ ...S.select, minWidth: 140 }} value={intervalFilter} onChange={e => setIntervalFilter(e.target.value)}>
+          {INTERVALS.map(i => <option key={i}>{i}</option>)}
+        </select>
+
+        <span style={{ fontSize: 12, color: S.T.textSecondary }}>
+          {tab === "registry" ? `${registryFiltered.length} of ${EQUIPMENT_REGISTRY.length}` : `${samplesFiltered.length} equipment`}
+        </span>
+
+        {(codeFilter !== "All" || classFilter !== "All Classes" || intervalFilter !== "All Intervals" || searchText) && (
+          <button style={{ ...S.btn, fontSize: 12, color: S.T.danger, borderColor: S.T.danger }}
+            onClick={() => { setCodeFilter("All"); setClassFilter("All Classes"); setIntervalFilter("All Intervals"); setSearchText(""); }}>
+            <i className="ti ti-x" aria-hidden /> Clear
+          </button>
+        )}
+      </div>
+
+      {/* ── Registry Tab ── */}
+      {tab === "registry" && (
+        <div style={{ overflowX: "auto" }}>
+          <table style={S.table}>
+            <thead>
+              <tr>
+                {["Equipment Code", "Description", "Asset ID", "Asset Class", "Lubricant", "Interval", "Manufacturer", "Model", "Samples"].map(h => (
+                  <th key={h} style={S.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {registryFiltered.map((e, i) => {
+                const hasSamples = !!equipMap[e.code];
+                const hasAlert = hasSamples && equipMap[e.code].some(s => s.reportStatus === "Alert");
+                const latestSample = hasSamples
+                  ? equipMap[e.code].sort((a, b) => new Date(b.sampledDate) - new Date(a.sampledDate))[0]
+                  : null;
+                const isExpanded = expandedEquip === e.code;
+                return (
+                  <React.Fragment key={i}>
+                  <tr style={{ cursor: hasSamples ? "pointer" : "default", background: isExpanded ? S.T.navActive : "transparent" }}
+                    onClick={() => hasSamples && setExpandedEquip(isExpanded ? null : e.code)}>
+                    <td style={{ ...S.td, fontFamily: "monospace", fontWeight: 600, whiteSpace: "nowrap" }}>
+                      {hasAlert && <span style={{ ...S.alertPulse, marginRight: 4 }} />}
+                      {hasSamples && <i className={`ti ti-chevron-${isExpanded?"down":"right"}`} style={{ marginRight:6, fontSize:12, color:S.T.textSecondary }} aria-hidden/>}
+                      <span style={{ color: hasSamples ? S.T.accent : S.T.textHighlight }}>{e.code}</span>
+                    </td>
+                    <td style={{ ...S.td, maxWidth: 220 }}>{e.description}</td>
+                    <td style={{ ...S.td, fontFamily: "monospace", color: S.T.textSecondary }}>{e.assetId || "—"}</td>
+                    <td style={S.td}>
+                      <span style={{
+                        background: e.assetClass === "Gear Drive" ? S.T.infoBarBg : e.assetClass === "Hydraulic" ? S.T.warningBg : S.T.cardSubBg,
+                        color: e.assetClass === "Gear Drive" ? S.T.accent : e.assetClass === "Hydraulic" ? S.T.warning : S.T.success,
+                        borderRadius: 4, padding: "2px 8px", fontSize: 11, fontWeight: 600, whiteSpace: "nowrap",
+                      }}>{e.assetClass}</span>
+                    </td>
+                    <td style={{ ...S.td, fontSize: 12 }}>{e.lubricant}</td>
+                    <td style={{ ...S.td, whiteSpace: "nowrap" }}>
+                      <span style={{
+                        background: e.interval === "Monthly" ? S.T.dangerBg : e.interval === "If needed" ? S.T.warningBg : S.T.successBg,
+                        color: e.interval === "Monthly" ? S.T.danger : e.interval === "If needed" ? S.T.warning : S.T.success,
+                        borderRadius: 4, padding: "2px 8px", fontSize: 11, fontWeight: 600,
+                      }}>{e.interval}</span>
+                    </td>
+                    <td style={{ ...S.td, color: S.T.textSecondary }}>{e.manufacturer}</td>
+                    <td style={{ ...S.td, fontSize: 11, color: S.T.textSecondary, maxWidth: 160 }}>{e.model || "—"}</td>
+                    <td style={S.td}>
+                      {hasSamples
+                        ? <span style={{ background: S.T.successBg, color: S.T.success, borderRadius: 4, padding: "2px 8px", fontSize: 11, fontWeight: 700 }}>
+                            {equipMap[e.code].length} sample{equipMap[e.code].length > 1 ? "s" : ""}
+                          </span>
+                        : <span style={{ color: S.T.textMuted, fontSize: 11 }}>—</span>}
+                    </td>
+                  </tr>
+                  {isExpanded && hasSamples && (
+                    <tr>
+                      <td colSpan={9} style={{ padding:0, border:"none" }}>
+                        <div style={{ background:S.T.cardSubBg, border:`1px solid ${S.T.border}`, borderRadius:8, margin:"4px 0 12px", padding:14 }}>
+                          <p style={{ margin:"0 0 10px", fontSize:12, fontWeight:700, color:S.T.textPrimary }}>
+                            <i className="ti ti-flask" aria-hidden style={{ marginRight:6 }}/>
+                            All samples for {e.code} ({equipMap[e.code].length})
+                          </p>
+                          <table style={{ ...S.table, fontSize:12 }}>
+                            <thead>
+                              <tr>
+                                {["Sample Date","Status","Equip. Rating","Lube Rating","Contam.","Visc@40°C","Actions"].map(h => (
+                                  <th key={h} style={S.th}>{h}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {[...equipMap[e.code]].sort((a,b)=>new Date(b.sampledDate)-new Date(a.sampledDate)).map((s,si) => (
+                                <tr key={si}>
+                                  <td style={{ ...S.td, whiteSpace:"nowrap" }}>{fmtDate(s.sampledDate)}</td>
+                                  <td style={S.td}><span style={S.badge(s.reportStatus)}>{s.reportStatus}</span></td>
+                                  <td style={S.td}><span style={S.badge(s.equipmentRating)}>{s.equipmentRating||"—"}</span></td>
+                                  <td style={S.td}><span style={S.badge(s.lubricantRating)}>{s.lubricantRating||"—"}</span></td>
+                                  <td style={S.td}><span style={S.badge(s.contaminationRating)}>{s.contaminationRating||"—"}</span></td>
+                                  <td style={{ ...S.td, fontFamily:"monospace" }}>{s.visc40C||"—"}</td>
+                                  <td style={S.td}>
+                                    <div style={{ display:"flex", gap:6 }}>
+                                      <button style={{ ...S.btn, padding:"3px 8px", fontSize:11 }} onClick={(ev)=>{ev.stopPropagation(); onSelectSample(s);}}>
+                                        <i className="ti ti-file-analytics" aria-hidden/> Report
+                                      </button>
+                                      <button style={{ ...S.btn, padding:"3px 8px", fontSize:11 }} onClick={(ev)=>{ev.stopPropagation(); setEditingSample(s);}}>
+                                        <i className="ti ti-edit" aria-hidden/>
+                                      </button>
+                                      <button style={{ ...S.btn, padding:"3px 8px", fontSize:11, color:S.T.danger, borderColor:S.T.danger }}
+                                        onClick={(ev)=>{ev.stopPropagation(); if(window.confirm(`Delete sample ${s.sampleId} (${fmtDate(s.sampledDate)})? This will remove it from the Google Sheet too.`)) onDeleteSample(s);}}>
+                                        <i className="ti ti-trash" aria-hidden/>
+                                      </button>
+                                    </div>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* ── Samples Tab ── */}
+      {tab === "samples" && (
+        samplesFiltered.length === 0
+          ? <div style={{ color: S.T.textSecondary, fontSize: 13 }}>No sample history found. Upload a PDF to get started.</div>
+          : samplesFiltered.map(([unitId, equipSamples]) => {
+            const latest = equipSamples.sort((a, b) => new Date(b.sampledDate) - new Date(a.sampledDate))[0];
+            const hasAlert = equipSamples.some(s => s.reportStatus === "Alert");
+            const relActions = actions.filter(a => a.unitId === unitId && (a.status === "Open" || a.status === "In Progress")).length;
+            const viscData = [...equipSamples].sort((a, b) => new Date(a.sampledDate) - new Date(b.sampledDate))
+              .map(s => ({ value: s.visc40C, label: fmtDate(s.sampledDate) })).filter(d => d.value);
+            const regEntry = EQUIPMENT_REGISTRY.find(e => e.code === unitId);
+            return (
+              <div key={unitId} style={{ ...S.card, borderLeft: hasAlert ? "4px solid #E63946" : "4px solid #2DC653" }}>
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+                      {hasAlert && <span style={S.alertPulse} />}
+                      <span style={{ fontSize: 16, fontWeight: 700, color: S.T.textPrimary, fontFamily: "monospace" }}>{unitId}</span>
+                      <span style={S.badge(latest.reportStatus)}>{latest.reportStatus}</span>
+                      {relActions > 0 && (
+                        <span style={{ background: S.T.warning, color: S.T.appBg, borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700 }}>
+                          {relActions} open action{relActions > 1 ? "s" : ""}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 13, color: S.T.textSecondary, marginBottom: 10 }}>{latest.description}</div>
+                    {regEntry && (
+                      <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginBottom: 8 }}>
+                        <span style={{ fontSize: 11, color: S.T.textMuted }}>
+                          Manufacturer: <span style={{ color: S.T.textSecondary }}>{regEntry.manufacturer}</span>
+                        </span>
+                        <span style={{ fontSize: 11, color: S.T.textMuted }}>
+                          Interval: <span style={{ color: S.T.textSecondary }}>{regEntry.interval}</span>
+                        </span>
+                        <span style={{ fontSize: 11, color: S.T.textMuted }}>
+                          Asset ID: <span style={{ color: S.T.textSecondary, fontFamily: "monospace" }}>{regEntry.assetId}</span>
+                        </span>
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 12, color: S.T.textSecondary }}>Lubricant: <span style={{ color: S.T.textHighlight }}>{latest.lubricant}</span></span>
+                      <span style={{ fontSize: 12, color: S.T.textSecondary }}>Last sample: <span style={{ color: S.T.textHighlight }}>{fmtDate(latest.sampledDate)}</span></span>
+                      <span style={{ fontSize: 12, color: S.T.textSecondary }}>Samples: <span style={{ color: S.T.textHighlight }}>{equipSamples.length}</span></span>
+                      <span style={{ fontSize: 12, color: S.T.textSecondary }}>Visc@40°C: <span style={{ color: S.T.accent, fontFamily: "monospace", fontWeight: 700 }}>{latest.visc40C} cSt</span></span>
+                    </div>
+                    {viscData.length >= 2 && (
+                      <div style={{ marginTop: 10 }}>
+                        <Sparkline data={viscData} color={S.T.accent} label="Viscosity trend" />
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8, marginLeft: 16 }}>
+                    {[...equipSamples].sort((a, b) => new Date(b.sampledDate) - new Date(a.sampledDate)).map((s, i) => (
+                      <button key={i} style={{ ...S.btn, fontSize: 12, whiteSpace: "nowrap" }}
+                        onClick={() => onSelectSample(s)}>
+                        {fmtDate(s.sampledDate)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            );
+          })
+      )}
+
+      {editingSample && (
+        <SampleEditModal
+          sample={editingSample}
+          onClose={() => setEditingSample(null)}
+          onSave={(updated) => { onEditSample(editingSample, updated); setEditingSample(null); }}
+        />
+      )}
+    </div>
+  );
+}
+const BLANK_SAMPLE = {
+  unitId:"", description:"", assetId:"", accountName:"Arabian Cement Company",
+  lubricant:"", assetClass:"", manufacturer:"", model:"",
+  serviceLevel:"Enhanced", bottleId:"", sampleId:"", sampledDate:"", reportedDate:"", sampledBy:"",
+  reportStatus:"Normal", contaminationRating:"Normal", equipmentRating:"Normal", lubricantRating:"Normal",
+  isoCode:"", particleCount4um:"", particleCount6um:"", particleCount14um:"",
+  pqIndex:"", visc40C:"", oxidation:"", tan:"", water:"",
+  wear:{ Ag:0, Al:0, Cr:0, Cu:0, Fe:0, Mo:0, Ni:0, Pb:0, Sn:0 },
+  contaminants:{ K:0, Na:0, Si:0 },
+  additives:{ B:0, Ba:0, Ca:0, Mg:0, P:0, Zn:0 },
+  recommendations:[],
+};
+
+const STATUS_OPTIONS = ["Normal","Caution","Alert","Warning"];
+const ASSET_CLASS_OPTIONS = ["Gear Drive","Circulating System","Hydraulic"];
+const WEAR_FULL   = { Ag:"Silver", Al:"Aluminum", Cr:"Chromium", Cu:"Copper", Fe:"Iron", Mo:"Molybdenum", Ni:"Nickel", Pb:"Lead", Sn:"Tin" };
+const CONT_FULL   = { K:"Potassium", Na:"Sodium", Si:"Silicon" };
+const ADD_FULL    = { B:"Boron", Ba:"Barium", Ca:"Calcium", Mg:"Magnesium", P:"Phosphorus", Zn:"Zinc" };
+
+function UploadPDF({ onAdd, existingSamples, webhookUrl, onSyncNeeded }) {
+  const [form, setForm]           = useState({ ...BLANK_SAMPLE, wear:{...BLANK_SAMPLE.wear}, contaminants:{...BLANK_SAMPLE.contaminants}, additives:{...BLANK_SAMPLE.additives} });
+  const [recText, setRecText]     = useState(""); // newline-separated recommendations
+  const [saved, setSaved]         = useState(false);
+  const [dupWarning, setDupWarning] = useState(false);
+
+  const existingIds = new Set((existingSamples||[]).map(s=>s.sampleId).filter(Boolean));
+
+  function setF(k,v){ setForm(p=>({...p,[k]:v})); }
+  function setWear(k,v){ setForm(p=>({...p, wear:{...p.wear,[k]:Number(v)||0}})); }
+  function setCont(k,v){ setForm(p=>({...p, contaminants:{...p.contaminants,[k]:Number(v)||0}})); }
+  function setAdd(k,v){ setForm(p=>({...p, additives:{...p.additives,[k]:Number(v)||0}})); }
+
+  // Auto-fill equipment info from registry when unitId selected
+  function onUnitSelect(code) {
+    const reg = EQUIPMENT_REGISTRY.find(e=>e.code===code);
+    setForm(p=>({...p,
+      unitId: code,
+      description: reg?.description || p.description,
+      assetId: reg?.assetId || p.assetId,
+      assetClass: reg?.assetClass || p.assetClass,
+      lubricant: reg?.lubricant || p.lubricant,
+      manufacturer: reg?.manufacturer || p.manufacturer,
+      model: reg?.model || p.model,
+    }));
+  }
+
+  function handleSave() {
+    if (!form.unitId)      { alert("Equipment ID is required."); return; }
+    if (!form.sampledDate) { alert("Sample Date is required."); return; }
+    if (form.sampleId && existingIds.has(form.sampleId)) {
+      setDupWarning(true); return;
+    }
+    doSave();
+  }
+
+  function doSave() {
+    const recs = recText.split("\n").map(r=>r.trim()).filter(Boolean);
+    onAdd([{ ...form, recommendations: recs }]);
+    setForm({...BLANK_SAMPLE, wear:{...BLANK_SAMPLE.wear}, contaminants:{...BLANK_SAMPLE.contaminants}, additives:{...BLANK_SAMPLE.additives}});
+    setRecText("");
+    setDupWarning(false);
+    setSaved(true);
+    setTimeout(()=>setSaved(false), 3000);
+  }
+
+  function handleReset() {
+    setForm({...BLANK_SAMPLE, wear:{...BLANK_SAMPLE.wear}, contaminants:{...BLANK_SAMPLE.contaminants}, additives:{...BLANK_SAMPLE.additives}});
+    setRecText(""); setDupWarning(false);
+  }
+
+  const inp  = (k, placeholder="", type="text") => (
+    <input style={{...S.input, fontSize:12, padding:"6px 10px"}} type={type}
+      value={form[k]??""} placeholder={placeholder}
+      onChange={e=>setF(k,e.target.value)} />
+  );
+  const sel  = (k, opts) => (
+    <select style={{...S.select, width:"100%", fontSize:12}} value={form[k]||""}
+      onChange={e=>setF(k,e.target.value)}>
+      <option value="">—</option>
+      {opts.map(o=><option key={o}>{o}</option>)}
+    </select>
+  );
+  const lbl  = (text, required=false) => (
+    <label style={{...S.label, fontSize:11, marginBottom:4}}>
+      {text}{required&&<span style={{color:S.T.danger}}> *</span>}
+    </label>
+  );
+  const section = (title, icon) => (
+    <div style={{padding:"8px 14px", background:S.T.infoBarBg, borderRadius:"6px 6px 0 0",
+      borderBottom:"1px solid #1E3A5F", display:"flex", alignItems:"center", gap:8, marginTop:20, marginBottom:0}}>
+      <i className={`ti ${icon}`} style={{color:S.T.accent, fontSize:15}} aria-hidden/>
+      <span style={{fontSize:13, fontWeight:700, color:S.T.textPrimary}}>{title}</span>
+    </div>
+  );
+  const card = (children, noPad=false) => (
+    <div style={{background:S.T.cardBg, border:"1px solid #1E3A5F", borderRadius:"0 0 6px 6px",
+      padding: noPad ? 0 : "14px 16px", marginBottom:4}}>
+      {children}
+    </div>
+  );
+  const grid = (cols, children) => (
+    <div style={{display:"grid", gridTemplateColumns:`repeat(${cols},1fr)`, gap:10}}>
+      {children}
+    </div>
+  );
+
+  const statusColor = s => s==="Alert"?S.T.danger:s==="Caution"?S.T.warning:s==="Normal"?S.T.success:S.T.border;
+
+  return (
+    <div style={{maxWidth:1100}}>
+      <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10, flexWrap:"wrap", gap:10}}>
+        <p style={{...S.sectionTitle, margin:0}}>Add New Sample</p>
+        <div style={{display:"flex", gap:8, alignItems:"center", flexWrap:"wrap"}}>
+          {saved && <span style={{fontSize:12, color:S.T.success, display:"flex", alignItems:"center", gap:6}}>
+            <i className="ti ti-circle-check" aria-hidden/> Sample saved to sheet
+          </span>}
+          {onSyncNeeded && (
+            <button style={{...S.btn, fontSize:12}} onClick={onSyncNeeded} title="Pull latest entries from Google Sheet to check for duplicates">
+              <i className="ti ti-cloud-download" aria-hidden/> Pull from Sheet
+            </button>
+          )}
+          <button style={{...S.btn, fontSize:12}} onClick={handleReset}>
+            <i className="ti ti-refresh" aria-hidden/> Reset Form
+          </button>
+          <button style={{...S.btnPrimary, fontSize:13}} onClick={handleSave}>
+            <i className="ti ti-database-plus" aria-hidden/> Save Sample
+          </button>
+        </div>
+      </div>
+      {/* Sheet sync info bar */}
+      <div style={{background:S.T.infoBarBg, border:"1px solid #1E3A5F", borderRadius:8, padding:"8px 14px", marginBottom:14, display:"flex", alignItems:"center", gap:14, flexWrap:"wrap"}}>
+        <div style={{display:"flex", alignItems:"center", gap:6}}>
+          <span style={{width:8, height:8, borderRadius:"50%", background: webhookUrl?S.T.success:S.T.danger}}/>
+          <span style={{fontSize:11, color:S.T.textSecondary}}>
+            {webhookUrl ? "Sheets connected — new entries write directly to Data_Entry tab" : "No webhook configured — go to Settings to connect"}
+          </span>
+        </div>
+        <span style={{fontSize:11, color:S.T.textMuted, marginLeft:"auto"}}>
+          {existingSamples?.length || 0} samples already in app (click 'Pull from Sheet' to refresh)
+        </span>
+      </div>
+
+      {/* Duplicate warning */}
+      {dupWarning && (
+        <div style={{background:S.T.warningBg, border:"1px solid #F4A261", borderRadius:8, padding:"12px 16px", marginBottom:16, display:"flex", alignItems:"center", justifyContent:"space-between", gap:12}}>
+          <div style={{display:"flex", alignItems:"center", gap:10}}>
+            <i className="ti ti-alert-triangle" style={{color:S.T.warning, fontSize:20}} aria-hidden/>
+            <div>
+              <p style={{margin:"0 0 2px", fontWeight:700, color:S.T.warning, fontSize:13}}>Sample ID already exists in database</p>
+              <p style={{margin:0, fontSize:12, color:S.T.textSubtle}}>Sample ID <span style={{fontFamily:"monospace", color:S.T.warning}}>{form.sampleId}</span> was already imported. Save anyway to overwrite, or change the Sample ID.</p>
+            </div>
+          </div>
+          <div style={{display:"flex", gap:8, flexShrink:0}}>
+            <button style={{...S.btnPrimary, fontSize:12}} onClick={doSave}>Save Anyway</button>
+            <button style={{...S.btn, fontSize:12}} onClick={()=>setDupWarning(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Equipment & Sample Identity ── */}
+      {section("Equipment & Sample Information", "ti-engine")}
+      {card(
+        <div>
+          {grid(3,[
+            <div key="uid">
+              {lbl("Equipment ID (Unit ID)", true)}
+              <select style={{...S.select, width:"100%", fontSize:12}} value={form.unitId||""}
+                onChange={e=>onUnitSelect(e.target.value)}>
+                <option value="">— Select Equipment —</option>
+                {EQUIPMENT_REGISTRY.map(e=>(
+                  <option key={e.code} value={e.code}>{e.code} — {e.description.slice(0,40)}</option>
+                ))}
+              </select>
+            </div>,
+            <div key="desc"><div>{lbl("Description")}{inp("description","Bucket Elevator GB - R")}</div></div>,
+            <div key="aid"><div>{lbl("Asset ID")}{inp("assetId","51526804")}</div></div>,
+            <div key="sid"><div>{lbl("Sample ID")}{inp("sampleId","26124405247")}</div></div>,
+            <div key="bid"><div>{lbl("Bottle ID")}{inp("bottleId","b108136193")}</div></div>,
+            <div key="svc"><div>{lbl("Service Level")}{inp("serviceLevel","Enhanced")}</div></div>,
+            <div key="sd"><div>{lbl("Sample Date", true)}{inp("sampledDate","26 Apr 2026")}</div></div>,
+            <div key="rd"><div>{lbl("Reported Date")}{inp("reportedDate","05 May 2026")}</div></div>,
+            <div key="sb"><div>{lbl("Sampled By")}{inp("sampledBy","Hassan Mostafa")}</div></div>,
+          ])}
+          <div style={{marginTop:10}}>
+            {grid(4,[
+              <div key="ac"><div>{lbl("Asset Class")}{sel("assetClass", ASSET_CLASS_OPTIONS)}</div></div>,
+              <div key="lub"><div>{lbl("Lubricant")}{inp("lubricant","MOBIL SHC 632")}</div></div>,
+              <div key="mfr"><div>{lbl("Manufacturer")}{inp("manufacturer","FLENDER")}</div></div>,
+              <div key="mod"><div>{lbl("Model")}{inp("model","N/A")}</div></div>,
+            ])}
+          </div>
+        </div>
+      )}
+
+      {/* ── Ratings ── */}
+      {section("Overall Ratings", "ti-award")}
+      {card(
+        <div>
+          {grid(4,[
+            <div key="rs">
+              {lbl("Report Status", true)}
+              <select style={{...S.select, width:"100%", fontSize:12,
+                borderColor: statusColor(form.reportStatus),
+                background: statusColor(form.reportStatus)+"22"}}
+                value={form.reportStatus||"Normal"} onChange={e=>setF("reportStatus",e.target.value)}>
+                {STATUS_OPTIONS.map(o=><option key={o}>{o}</option>)}
+              </select>
+            </div>,
+            <div key="cr">
+              {lbl("Contamination Rating")}
+              <select style={{...S.select, width:"100%", fontSize:12, borderColor:statusColor(form.contaminationRating)}}
+                value={form.contaminationRating||""} onChange={e=>setF("contaminationRating",e.target.value)}>
+                <option value="">—</option>
+                {STATUS_OPTIONS.map(o=><option key={o}>{o}</option>)}
+              </select>
+            </div>,
+            <div key="er">
+              {lbl("Equipment Rating")}
+              <select style={{...S.select, width:"100%", fontSize:12, borderColor:statusColor(form.equipmentRating)}}
+                value={form.equipmentRating||""} onChange={e=>setF("equipmentRating",e.target.value)}>
+                <option value="">—</option>
+                {STATUS_OPTIONS.map(o=><option key={o}>{o}</option>)}
+              </select>
+            </div>,
+            <div key="lr">
+              {lbl("Lubricant Rating")}
+              <select style={{...S.select, width:"100%", fontSize:12, borderColor:statusColor(form.lubricantRating)}}
+                value={form.lubricantRating||""} onChange={e=>setF("lubricantRating",e.target.value)}>
+                <option value="">—</option>
+                {STATUS_OPTIONS.map(o=><option key={o}>{o}</option>)}
+              </select>
+            </div>,
+          ])}
+        </div>
+      )}
+
+      {/* ── Lubricant Properties ── */}
+      {section("Lubricant Properties", "ti-flask")}
+      {card(
+        <div>
+          {grid(4,[
+            <div key="iso"><div>{lbl("ISO Code (4/6/14)")}{inp("isoCode","20/19/17")}</div></div>,
+            <div key="pc4"><div>{lbl("Particle Count >4µm")}{inp("particleCount4um","8914","number")}</div></div>,
+            <div key="pc6"><div>{lbl("Particle Count >6µm")}{inp("particleCount6um","3607","number")}</div></div>,
+            <div key="pc14"><div>{lbl("Particle Count >14µm")}{inp("particleCount14um","912","number")}</div></div>,
+            <div key="pq"><div>{lbl("PQ Index")}{inp("pqIndex","9","number")}</div></div>,
+            <div key="v40"><div>{lbl("Visc@40°C (cSt)")}{inp("visc40C","313.9","number")}</div></div>,
+            <div key="ox"><div>{lbl("Oxidation (Ab/cm)")}{inp("oxidation","2","number")}</div></div>,
+            <div key="tan"><div>{lbl("TAN (mg KOH/g)")}{inp("tan","1.5","number")}</div></div>,
+            <div key="wat"><div>{lbl("Water (Vol%)")}{inp("water","<0.003")}</div></div>,
+          ])}
+        </div>
+      )}
+
+      {/* ── Wear Metals ── */}
+      {section("Wear Metals (ppm)", "ti-tool")}
+      {card(
+        <div>
+          {grid(9, Object.keys(WEAR_FULL).map(k=>(
+            <div key={k}>
+              <label style={{...S.label, fontSize:11, textAlign:"center", display:"block"}}>
+                {k}<span style={{display:"block", fontSize:9, color:S.T.textMuted}}>{WEAR_FULL[k]}</span>
+              </label>
+              <input style={{...S.input, fontSize:12, padding:"6px 8px", textAlign:"center",
+                borderColor: (form.wear[k]||0)>0 ? (k==="Fe"&&form.wear[k]>20?S.T.danger:k==="Cu"&&form.wear[k]>10?S.T.danger:S.T.warning) : S.T.border}}
+                type="number" min="0" value={form.wear[k]??0}
+                onChange={e=>setWear(k,e.target.value)} />
+            </div>
+          )))}
+        </div>
+      )}
+
+      {/* ── Contaminants ── */}
+      {section("Contaminants (ppm)", "ti-alert-triangle")}
+      {card(
+        <div>
+          {grid(3, Object.keys(CONT_FULL).map(k=>(
+            <div key={k}>
+              <label style={{...S.label, fontSize:11}}>
+                {k} ({CONT_FULL[k]})
+              </label>
+              <input style={{...S.input, fontSize:12, padding:"6px 10px",
+                borderColor: (form.contaminants[k]||0)>0 ? (k==="Si"&&form.contaminants[k]>20?S.T.danger:S.T.warning) : S.T.border}}
+                type="number" min="0" value={form.contaminants[k]??0}
+                onChange={e=>setCont(k,e.target.value)} />
+            </div>
+          )))}
+        </div>
+      )}
+
+      {/* ── Additives ── */}
+      {section("Additives (ppm)", "ti-droplet")}
+      {card(
+        <div>
+          {grid(6, Object.keys(ADD_FULL).map(k=>(
+            <div key={k}>
+              <label style={{...S.label, fontSize:11}}>
+                {k} ({ADD_FULL[k]})
+              </label>
+              <input style={{...S.input, fontSize:12, padding:"6px 10px"}}
+                type="number" min="0" value={form.additives[k]??0}
+                onChange={e=>setAdd(k,e.target.value)} />
+            </div>
+          )))}
+        </div>
+      )}
+
+      {/* ── Recommendations ── */}
+      {section("Recommendations / Comments", "ti-clipboard-list")}
+      {card(
+        <div>
+          <p style={{fontSize:11, color:S.T.textSecondary, marginBottom:8}}>
+            Enter each recommendation on a new line (copy from Mobil report PDF)
+          </p>
+          <textarea
+            style={{...S.input, fontSize:12, padding:"10px 12px", width:"100%", minHeight:120,
+              resize:"vertical", fontFamily:"inherit", lineHeight:1.6}}
+            placeholder={"ACTION REQUIRED - ELEVATED SILICON LEVEL. Determine source...\nACTION REQUIRED - EXCESSIVE WATER CONTAMINATION. Determine source..."}
+            value={recText}
+            onChange={e=>setRecText(e.target.value)}
+          />
+          <p style={{fontSize:11, color:S.T.textMuted, marginTop:6}}>
+            {recText.split("\n").filter(r=>r.trim()).length} recommendation(s) entered
+          </p>
+        </div>
+      )}
+
+      {/* ── Save button (bottom) ── */}
+      <div style={{display:"flex", gap:10, alignItems:"center", marginTop:20, paddingTop:16, borderTop:"1px solid #1E3A5F"}}>
+        <button style={{...S.btnPrimary, fontSize:14, padding:"10px 24px"}} onClick={handleSave}>
+          <i className="ti ti-database-plus" aria-hidden/> Save Sample to Database
+        </button>
+        <button style={{...S.btn, fontSize:13}} onClick={handleReset}>
+          <i className="ti ti-refresh" aria-hidden/> Reset
+        </button>
+        {saved && <span style={{fontSize:12, color:S.T.success, display:"flex", alignItems:"center", gap:6}}>
+          <i className="ti ti-circle-check" aria-hidden/> Saved!
+        </span>}
+      </div>
+    </div>
+  );
+}
+
+
+// ─── Action Tracker ───────────────────────────────────────────────────────────
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const SAMPLE_RESULTS = ["NORMAL","CAUTION","ALERT","SATISFACTORY","UNSATISFACTORY"];
+const CONTRACTOR_OPTIONS = ["ASEC","Contractor","Internal","ExxonMobil","Other"];
+
+const EMPTY_ACTION = {
+  acNo: "", equipmentCode: "", description: "", oilType: "", revisionDate: "",
+  sampleDate: "", sampleResult: "", sampleAnalysis: "", lastChange: "",
+  status: "Open", contractorAction: "", contractor: "ASEC", completedDate: "",
+  prevMonthAgreedAction: "", accAction: "", agreedAction: "", notes: "",
+  createdAt: new Date().toISOString(),
+};
+
+// ─── Action Edit Modal ──────────────────────────────────────────────────────
+function ActionEditModal({ action, onSave, onClose, isNew }) {
+  const [form, setForm] = useState({ ...action });
+  function set(k, v) { setForm(f => ({ ...f, [k]: v })); }
+
+  function setEquipment(code) {
+    const reg = EQUIPMENT_REGISTRY.find(e => e.code === code);
+    setForm(f => ({ ...f, equipmentCode: code, oilType: reg?.lubricant || f.oilType }));
+  }
+
+  const fieldStyle = { ...S.input, fontSize:13 };
+  const lbl = t => <label style={{ ...S.label, fontSize:11 }}>{t}</label>;
+  const dateVal = v => (v && v.match(/^\d{4}-\d{2}-\d{2}/)) ? v : "";
+  const readOnlyBox = (val) => (
+    <div style={{ ...fieldStyle, background:S.T.cardSubBg, color:S.T.textSecondary, display:"flex", alignItems:"center", cursor:"not-allowed" }}>
+      {val || "—"}
+    </div>
+  );
+
+  const selectField = (key, label, options) => (
+    <div>{lbl(label)}
+      <select style={{ ...fieldStyle, cursor:"pointer" }} value={form[key]||""} onChange={e=>set(key,e.target.value)}>
+        <option value="">—</option>
+        {options.map(o => <option key={o}>{o}</option>)}
+      </select>
+    </div>
+  );
+  const dateField = (key, label) => (
+    <div>{lbl(label)}<input style={fieldStyle} type="date" value={dateVal(form[key])} onChange={e=>set(key,e.target.value)} /></div>
+  );
+  const textField = (key, label) => (
+    <div>{lbl(label)}<input style={fieldStyle} value={form[key]||""} onChange={e=>set(key,e.target.value)} /></div>
+  );
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", zIndex:1000,
+      display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}
+      onClick={onClose}>
+      <div style={{ background:S.T.cardBg, border:`1px solid ${S.T.border}`, borderRadius:12,
+        width:"100%", maxWidth:760, maxHeight:"90vh", overflowY:"auto", padding:24 }}
+        onClick={e => e.stopPropagation()}>
+
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:18 }}>
+          <div>
+            <p style={{ margin:0, fontSize:16, fontWeight:700, color:S.T.textPrimary }}>{isNew ? "New Action" : `Edit Action — ${form.equipmentCode||"—"}`}</p>
+            <p style={{ margin:"2px 0 0", fontSize:12, color:S.T.textSecondary }}>Ac. No. {form.acNo || "—"} {isNew && <span style={{ color:S.T.textMuted }}>(auto-generated)</span>}</p>
+          </div>
+          <button style={{ ...S.btn, padding:"6px 10px" }} onClick={onClose}><i className="ti ti-x" aria-hidden/></button>
+        </div>
+
+        <p style={{ fontSize:12, fontWeight:700, color:S.T.accent, margin:"0 0 8px" }}>Identification</p>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))", gap:12, marginBottom:14 }}>
+          <div>{lbl("Ac. No. (auto)")}{readOnlyBox(form.acNo)}</div>
+          <div>{lbl("Equipment Code")}
+            <EquipmentSelect value={form.equipmentCode} onChange={setEquipment} width="100%" />
+          </div>
+          {textField("description","Description")}
+          <div>{lbl("Oil Type (auto from equipment)")}{readOnlyBox(form.oilType)}</div>
+        </div>
+
+        <p style={{ fontSize:12, fontWeight:700, color:S.T.accent, margin:"0 0 8px" }}>Sample &amp; Dates</p>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))", gap:12, marginBottom:14 }}>
+          {dateField("revisionDate","Revision Date")}
+          {dateField("sampleDate","Sample Date")}
+          {selectField("sampleResult","Sample Result", SAMPLE_RESULTS)}
+          {dateField("lastChange","Last Change")}
+          {dateField("completedDate","Completed Date")}
+        </div>
+        <div style={{ marginBottom:14 }}>
+          {lbl("Sample Analysis")}
+          <textarea style={{ width:"100%", padding:"8px 10px", fontSize:13, minHeight:50, resize:"vertical" }}
+            value={form.sampleAnalysis||""} onChange={e=>set("sampleAnalysis",e.target.value)} />
+        </div>
+
+        <p style={{ fontSize:12, fontWeight:700, color:S.T.accent, margin:"0 0 8px" }}>Status &amp; Contractor</p>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))", gap:12, marginBottom:14 }}>
+          {selectField("status","Status", ACTION_STATUSES)}
+          {selectField("contractor","Contractor", CONTRACTOR_OPTIONS)}
+        </div>
+        <div style={{ marginBottom:14 }}>
+          {lbl("Contractor Action")}
+          <textarea style={{ width:"100%", padding:"8px 10px", fontSize:13, minHeight:50, resize:"vertical" }}
+            value={form.contractorAction||""} onChange={e=>set("contractorAction",e.target.value)} />
+        </div>
+
+        <p style={{ fontSize:12, fontWeight:700, color:S.T.accent, margin:"0 0 8px" }}>Actions &amp; Comments</p>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:18 }}>
+          <div>{lbl("Prev. Month Agreed Action")}
+            <textarea style={{ width:"100%", padding:"8px 10px", fontSize:13, minHeight:60, resize:"vertical" }}
+              value={form.prevMonthAgreedAction||""} onChange={e=>set("prevMonthAgreedAction",e.target.value)} />
+          </div>
+          <div>{lbl("ACC Action")}
+            <textarea style={{ width:"100%", padding:"8px 10px", fontSize:13, minHeight:60, resize:"vertical" }}
+              value={form.accAction||""} onChange={e=>set("accAction",e.target.value)} />
+          </div>
+          <div style={{ gridColumn:"1 / -1" }}>{lbl("Agreed Action")}
+            <textarea style={{ width:"100%", padding:"8px 10px", fontSize:13, minHeight:60, resize:"vertical" }}
+              value={form.agreedAction||""} onChange={e=>set("agreedAction",e.target.value)} />
+          </div>
+        </div>
+
+        <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
+          <button style={S.btn} onClick={onClose}>Cancel</button>
+          <button style={S.btnPrimary} onClick={() => onSave(form)}>
+            <i className="ti ti-device-floppy" aria-hidden/> Save Changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Action View Card (read-only, with Edit button) ────────────────────────────
+function ActionViewCard({ action, onEdit, onClose }) {
+  const sc = { Open:S.T.danger, "In Progress":S.T.warning, Closed:S.T.success, "Waiting Stoppage":S.T.accent }[action.status] || S.T.textSecondary;
+  const rc = { ALERT:S.T.danger, CAUTION:S.T.warning, NORMAL:S.T.success, SATISFACTORY:S.T.success, UNSATISFACTORY:S.T.danger }[(action.sampleResult||"").toUpperCase()] || S.T.textSecondary;
+  const row = (label, value) => (
+    <div style={{ marginBottom:10 }}>
+      <div style={{ fontSize:11, color:S.T.textSecondary }}>{label}</div>
+      <div style={{ fontSize:13, color:S.T.textPrimary, marginTop:2 }}>{value || "—"}</div>
+    </div>
+  );
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", zIndex:1000,
+      display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}
+      onClick={onClose}>
+      <div style={{ background:S.T.cardBg, border:`1px solid ${S.T.border}`, borderRadius:12,
+        width:"100%", maxWidth:560, maxHeight:"85vh", overflowY:"auto", padding:24 }}
+        onClick={e => e.stopPropagation()}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16 }}>
+          <div>
+            <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+              <span style={{ fontSize:16, fontWeight:700, color:S.T.accent, fontFamily:"monospace" }}>{action.equipmentCode}</span>
+              <span style={{ background:sc+"22", color:sc, borderRadius:4, padding:"2px 10px", fontSize:11, fontWeight:700 }}>{action.status}</span>
+            </div>
+            <div style={{ fontSize:12, color:S.T.textSecondary, marginTop:2 }}>Ac. No. {action.acNo||"—"} · {action.description||"—"}</div>
+          </div>
+          <button style={{ ...S.btn, padding:"6px 10px" }} onClick={onClose}><i className="ti ti-x" aria-hidden/></button>
+        </div>
+
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8, marginBottom:6 }}>
+          {row("Oil Type", action.oilType)}
+          {row("Revision Date", fmtDate(action.revisionDate))}
+          {row("Sample Date", fmtDate(action.sampleDate))}
+          <div style={{ marginBottom:10 }}>
+            <div style={{ fontSize:11, color:S.T.textSecondary }}>Sample Result</div>
+            <div style={{ marginTop:2 }}>{action.sampleResult ? <span style={{ background:rc+"22", color:rc, borderRadius:4, padding:"2px 8px", fontSize:11, fontWeight:700 }}>{action.sampleResult}</span> : "—"}</div>
+          </div>
+          {row("Last Change", fmtDate(action.lastChange))}
+          {row("Completed Date", fmtDate(action.completedDate))}
+          {row("Contractor", action.contractor)}
+        </div>
+
+        {row("Sample Analysis", action.sampleAnalysis)}
+        {row("Contractor Action", action.contractorAction)}
+        {row("Prev. Month Agreed Action", action.prevMonthAgreedAction)}
+        {row("ACC Action", action.accAction)}
+        {row("Agreed Action", action.agreedAction)}
+
+        <div style={{ display:"flex", gap:10, justifyContent:"flex-end", marginTop:8 }}>
+          <button style={S.btn} onClick={onClose}>Close</button>
+          <button style={S.btnPrimary} onClick={onEdit}><i className="ti ti-edit" aria-hidden/> Edit</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Shared "Related Actions" panel — used by SampleReport & OilAnalysisReport ─
+function ActionsMiniPanel({ equipmentCode, actions, onAdd, onUpdate, title, limit }) {
+  const [viewingAction, setViewingAction] = useState(null);   // { action, idx }
+  const [editingAction, setEditingAction] = useState(null);   // { action, idx, isNew }
+
+  const equipActions = (actions||[])
+    .filter(a => (a.equipmentCode || a.unitId || "") === equipmentCode)
+    .sort((a,b) => new Date(b.revisionDate||b.sampleDate||b.createdAt||0) - new Date(a.revisionDate||a.sampleDate||a.createdAt||0))
+    .slice(0, limit || 5);
+
+  function openAdd() {
+    const reg = EQUIPMENT_REGISTRY.find(e => e.code === equipmentCode);
+    setEditingAction({
+      action: { ...EMPTY_ACTION, acNo: nextAcNo(actions), equipmentCode, oilType: reg?.lubricant||"", createdAt: new Date().toISOString() },
+      idx: null, isNew: true
+    });
+  }
+
+  function openEdit(a) {
+    const idx = actions.indexOf(a);
+    setEditingAction({ action: a, idx, isNew: false });
+    setViewingAction(null);
+  }
+
+  function save(form) {
+    if (editingAction.isNew) onAdd(form);
+    else onUpdate(editingAction.idx, form);
+    setEditingAction(null);
+  }
+
+  const sc = (status) => ({ Open:S.T.danger, "In Progress":S.T.warning, Closed:S.T.success, "Waiting Stoppage":S.T.accent }[status] || S.T.textSecondary);
+  const rc = (r) => ({ ALERT:S.T.danger, CAUTION:S.T.warning, NORMAL:S.T.success, SATISFACTORY:S.T.success, UNSATISFACTORY:S.T.danger }[(r||"").toUpperCase()] || S.T.textSecondary);
+
+  return (
+    <div style={S.card}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <i className="ti ti-checklist" style={{ color:S.T.accent, fontSize:18 }} aria-hidden/>
+          <span style={{ fontWeight:700, fontSize:14, color:S.T.textPrimary }}>{title || `Last ${limit||5} Actions`} — {equipmentCode}</span>
+        </div>
+        <button style={S.btnPrimary} onClick={openAdd}>
+          <i className="ti ti-plus" aria-hidden/> Add Action
+        </button>
+      </div>
+
+      {equipActions.length === 0 ? (
+        <div style={{ textAlign:"center", padding:"20px 0", color:S.T.textMuted, fontSize:13 }}>
+          No actions recorded for this equipment.
+        </div>
+      ) : (
+        <div style={{ overflowX:"auto" }}>
+          <table style={{ ...S.table, fontSize:12 }}>
+            <thead>
+              <tr>
+                {["Ac.No","Revision Date","Sample Date","Sample Result","Status","Agreed Action","Completed Date","Edit"].map(h => (
+                  <th key={h} style={S.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {equipActions.map((a, i) => (
+                <tr key={i} style={{ cursor:"pointer" }} onClick={() => setViewingAction(a)}>
+                  <td style={{ ...S.td, color:S.T.textSecondary, fontSize:11, fontFamily:"monospace" }}>{a.acNo||"—"}</td>
+                  <td style={{ ...S.td, whiteSpace:"nowrap" }}>{fmtDate(a.revisionDate)}</td>
+                  <td style={{ ...S.td, whiteSpace:"nowrap" }}>{fmtDate(a.sampleDate)}</td>
+                  <td style={S.td}>
+                    {a.sampleResult && <span style={{ background:rc(a.sampleResult)+"22", color:rc(a.sampleResult), borderRadius:4, padding:"2px 8px", fontSize:11, fontWeight:700 }}>{a.sampleResult}</span>}
+                  </td>
+                  <td style={S.td}>
+                    <span style={{ background:sc(a.status)+"22", color:sc(a.status), borderRadius:4, padding:"2px 8px", fontSize:11, fontWeight:600, whiteSpace:"nowrap" }}>{a.status||"—"}</span>
+                  </td>
+                  <td style={{ ...S.td, maxWidth:200, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={a.agreedAction}>{a.agreedAction||"—"}</td>
+                  <td style={{ ...S.td, whiteSpace:"nowrap" }}>{fmtDate(a.completedDate)}</td>
+                  <td style={S.td}>
+                    <button style={{ ...S.btn, padding:"3px 7px", fontSize:11 }} onClick={(e)=>{e.stopPropagation(); openEdit(a);}}>
+                      <i className="ti ti-edit" aria-hidden/>
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {viewingAction && (
+        <ActionViewCard action={viewingAction} onClose={() => setViewingAction(null)} onEdit={() => openEdit(viewingAction)} />
+      )}
+      {editingAction && (
+        <ActionEditModal action={editingAction.action} isNew={editingAction.isNew}
+          onClose={() => setEditingAction(null)} onSave={save} />
+      )}
+    </div>
+  );
+}
+
+function ActionTracker({ actions, onUpdate, onDelete, onAdd, samples }) {
+  const [statusFilter, setStatusFilter] = useState("All");
+  const [equipFilter, setEquipFilter] = useState("All");
+  const [monthFilter, setMonthFilter] = useState("All");
+  const [yearFilter, setYearFilter] = useState("All");
+  const [editingAction, setEditingAction] = useState(null); // { idx, action }
+  const [viewingAction, setViewingAction] = useState(null); // action card view
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [newForm, setNewForm] = useState({ ...EMPTY_ACTION });
+
+  // Derive unique equipment codes from registry + existing actions
+  const equipCodes = ["All", ...Array.from(new Set([
+    ...EQUIPMENT_REGISTRY.map(e => e.code),
+    ...actions.map(a => a.equipmentCode).filter(Boolean),
+  ])).sort()];
+
+  // Derive available years from actions
+  const years = ["All", ...Array.from(new Set(actions.map(a => {
+    const d = a.revisionDate || a.createdAt;
+    return d ? new Date(d).getFullYear().toString() : null;
+  }).filter(Boolean))).sort((a, b) => b - a)];
+
+  const filtered = actions.filter(a => {
+    const statusOk = statusFilter === "All" || a.status === statusFilter;
+    const equipOk = equipFilter === "All" || a.equipmentCode === equipFilter;
+    const d = a.revisionDate || a.createdAt;
+    const dt = d ? new Date(d) : null;
+    const monthOk = monthFilter === "All" || (dt && MONTHS[dt.getMonth()] === monthFilter);
+    const yearOk = yearFilter === "All" || (dt && dt.getFullYear().toString() === yearFilter);
+    return statusOk && equipOk && monthOk && yearOk;
+  });
+
+  // Sort by most recent sample/created date first, Open/In Progress first
+  const sorted = [...filtered].sort((a,b) => {
+    const order = { "Open":0, "In Progress":1, "Waiting Stoppage":2, "Closed":3 };
+    const oa = order[a.status] ?? 4, ob = order[b.status] ?? 4;
+    if (oa !== ob) return oa - ob;
+    return new Date(b.revisionDate||b.createdAt||0) - new Date(a.revisionDate||a.createdAt||0);
+  });
+
+  // Summary counts
+  const counts = { Open: 0, "In Progress": 0, Closed: 0, "Waiting Stoppage": 0 };
+  filtered.forEach(a => { if (counts[a.status] !== undefined) counts[a.status]++; });
+
+  function submitAdd() {
+    const next = { ...newForm, acNo: nextAcNo(actions), createdAt: new Date().toISOString(), _id: Date.now() };
+    onAdd(next);
+    setNewForm({ ...EMPTY_ACTION });
+    setShowAddForm(false);
+  }
+
+  const sampleResultColor = (r) => {
+    if (!r) return {};
+    const m = { ALERT: { bg:S.T.danger, color:"#fff" }, CAUTION: { bg:S.T.warning, color:"#fff" },
+      NORMAL: { bg:S.T.success, color:"#fff" }, SATISFACTORY: { bg:S.T.success, color:"#fff" },
+      UNSATISFACTORY: { bg:S.T.danger, color:"#fff" } };
+    return m[r?.toUpperCase()] || { bg:S.T.border, color:S.T.textPrimary };
+  };
+
+  const renderCell = (col, form, setForm) => {
+    const val = form[col.key] ?? "";
+    const baseStyle = { ...S.input, padding: "4px 6px", fontSize: 12, minWidth: col.width - 16 };
+    if (col.type === "select") {
+      const opts = col.key === "equipmentCode" ? EQUIPMENT_REGISTRY.map(e => e.code) : col.options;
+      return (
+        <select style={{ ...S.select, fontSize: 12, width: "100%" }} value={val}
+          onChange={e => setForm({ ...form, [col.key]: e.target.value })}>
+          <option value="">—</option>
+          {opts.map(o => <option key={o}>{o}</option>)}
+        </select>
+      );
+    }
+    if (col.type === "date") return (
+      <input type="date" style={baseStyle} value={val}
+        onChange={e => setForm({ ...form, [col.key]: e.target.value })} />
+    );
+    return (
+      <input style={baseStyle} value={val}
+        onChange={e => setForm({ ...form, [col.key]: e.target.value })} />
+    );
+  };
+
+  return (
+    <div>
+      <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
+
+      {/* Summary cards */}
+      <div style={{ display:"flex", gap:12, marginBottom:20, flexWrap:"wrap" }}>
+        {[
+          { label:"Open", count:counts["Open"], color:S.T.danger, status:"Open" },
+          { label:"In Progress", count:counts["In Progress"], color:S.T.warning, status:"In Progress" },
+          { label:"Completed", count:counts["Closed"], color:S.T.success, status:"Closed" },
+          { label:"Waiting Stoppage", count:counts["Waiting Stoppage"], color:S.T.accent, status:"Waiting Stoppage" },
+          { label:"Total Actions", count:filtered.length, color:S.T.textSecondary, status:"All" },
+        ].map(c => (
+          <div key={c.label} style={{ ...S.metricCard, minWidth:110, padding:"12px 16px", cursor:"pointer",
+            border:`1px solid ${statusFilter===c.status ? c.color : "transparent"}` }}
+            onClick={() => setStatusFilter(statusFilter===c.status ? "All" : c.status)}>
+            <div style={{ fontSize:11, color:S.T.textSecondary, marginBottom:4 }}>{c.label}</div>
+            <div style={{ fontSize:26, fontWeight:700, color:c.color }}>{c.count}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Filters */}
+      <div style={{ display:"flex", gap:10, marginBottom:16, flexWrap:"wrap", alignItems:"center" }}>
+        <EquipmentSelect value={equipFilter} onChange={setEquipFilter} allowAll width={240} placeholder="— All Equipment —" />
+
+        <select style={{ ...S.select, minWidth:130 }} value={monthFilter} onChange={e => setMonthFilter(e.target.value)}>
+          <option value="All">— All Months —</option>
+          {MONTHS.map(m => <option key={m}>{m}</option>)}
+        </select>
+
+        <select style={{ ...S.select, minWidth:100 }} value={yearFilter} onChange={e => setYearFilter(e.target.value)}>
+          {years.map(y => <option key={y}>{y === "All" ? "— All Years —" : y}</option>)}
+        </select>
+
+        <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+          {["All",...ACTION_STATUSES].map(s => (
+            <button key={s} style={{
+              ...S.btn, fontSize:11, padding:"5px 10px",
+              background: statusFilter===s ? S.T.accent:S.T.border,
+              color: statusFilter===s ? S.T.appBg:S.T.textPrimary,
+              borderColor: statusFilter===s ? S.T.accent:S.T.border,
+            }} onClick={() => setStatusFilter(s)}>{s}</button>
+          ))}
+        </div>
+
+        {(statusFilter!=="All"||equipFilter!=="All"||monthFilter!=="All"||yearFilter!=="All") && (
+          <button style={{ ...S.btn, fontSize:11, color:S.T.danger, borderColor:S.T.danger, padding:"5px 10px" }}
+            onClick={() => { setStatusFilter("All"); setEquipFilter("All"); setMonthFilter("All"); setYearFilter("All"); }}>
+            <i className="ti ti-x" aria-hidden /> Clear
+          </button>
+        )}
+
+        <button style={{ ...S.btnPrimary, marginLeft:"auto" }} onClick={() => setShowAddForm(!showAddForm)}>
+          <i className="ti ti-plus" aria-hidden /> Add Action
+        </button>
+      </div>
+
+      {/* Add Form */}
+      {showAddForm && (
+        <div style={{ ...S.card, marginBottom:16, border:`1px solid ${S.T.accent}` }}>
+          <p style={{ fontSize:13, fontWeight:700, color:S.T.accent, margin:"0 0 14px", display:"flex", alignItems:"center", gap:6 }}>
+            <i className="ti ti-plus" aria-hidden /> New Action
+          </p>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:12 }}>
+            <div>
+              <label style={S.label}>Ac. No. (auto)</label>
+              <div style={{ ...S.input, padding:"4px 6px", fontSize:12, background:S.T.cardSubBg, color:S.T.textSecondary, display:"flex", alignItems:"center" }}>{nextAcNo(actions)}</div>
+            </div>
+            <div>
+              <label style={S.label}>Equipment Code</label>
+              <EquipmentSelect value={newForm.equipmentCode} width="100%"
+                onChange={(code) => {
+                  const reg = EQUIPMENT_REGISTRY.find(e => e.code === code);
+                  setNewForm(f => ({ ...f, equipmentCode: code, oilType: reg?.lubricant || f.oilType }));
+                }} />
+            </div>
+            <div>
+              <label style={S.label}>Oil Type (auto)</label>
+              <div style={{ ...S.input, padding:"4px 6px", fontSize:12, background:S.T.cardSubBg, color:S.T.textSecondary, display:"flex", alignItems:"center" }}>{newForm.oilType || "—"}</div>
+            </div>
+            {[
+              { key:"revisionDate", label:"Revision Date", type:"date" },
+              { key:"sampleDate", label:"Sample Date", type:"date" },
+              { key:"sampleResult", label:"Sample Result", type:"select", options:SAMPLE_RESULTS },
+              { key:"lastChange", label:"Last Change", type:"date" },
+              { key:"status", label:"Status", type:"select", options:ACTION_STATUSES },
+              { key:"contractor", label:"Contractor", type:"select", options:CONTRACTOR_OPTIONS },
+              { key:"completedDate", label:"Completed Date", type:"date" },
+            ].map(col => (
+              <div key={col.key}>
+                <label style={S.label}>{col.label}</label>
+                {renderCell(col, newForm, setNewForm)}
+              </div>
+            ))}
+          </div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:12 }}>
+            {[
+              { key:"description", label:"Description" },
+              { key:"sampleAnalysis", label:"Sample Analysis" },
+              { key:"contractorAction", label:"Contractor Action" },
+              { key:"prevMonthAgreedAction", label:"Prev. Month Agreed Action" },
+              { key:"accAction", label:"ACC Action" },
+              { key:"agreedAction", label:"Agreed Action" },
+            ].map(col => (
+              <div key={col.key}>
+                <label style={S.label}>{col.label}</label>
+                <input style={S.input} value={newForm[col.key]||""} onChange={e => setNewForm({ ...newForm, [col.key]: e.target.value })} />
+              </div>
+            ))}
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <button style={S.btnPrimary} onClick={submitAdd}>Save Action</button>
+            <button style={S.btn} onClick={() => setShowAddForm(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Compact, readable table */}
+      <div style={{ fontSize:12, color:S.T.textSecondary, marginBottom:8 }}>{filtered.length} action{filtered.length!==1?"s":""}</div>
+      {filtered.length === 0
+        ? <div style={{ color:S.T.textSecondary, fontSize:13, padding:32, textAlign:"center" }}>No actions match the current filters.</div>
+        : (
+          <div style={{ ...S.card, overflowX:"auto", padding:0 }}>
+            <table style={S.table}>
+              <thead>
+                <tr>
+                  {["Ac.No","Equipment","Description","Revision Date","Sample Date","Result","Status","Agreed Action","Contractor","Completed","Actions"].map(h => (
+                    <th key={h} style={S.th}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map((a, i) => {
+                  const globalIdx = actions.indexOf(a);
+                  const rc = sampleResultColor(a.sampleResult);
+                  return (
+                    <tr key={i} style={{ cursor:"pointer" }} onClick={() => setViewingAction(a)}>
+                      <td style={{ ...S.td, color:S.T.textSecondary, fontFamily:"monospace", whiteSpace:"nowrap" }}>{a.acNo||"—"}</td>
+                      <td style={{ ...S.td, fontFamily:"monospace", fontWeight:600, color:S.T.accent, whiteSpace:"nowrap" }}>{a.equipmentCode||"—"}</td>
+                      <td style={{ ...S.td, maxWidth:220, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={a.description}>{a.description||"—"}</td>
+                      <td style={{ ...S.td, whiteSpace:"nowrap" }}>{fmtDate(a.revisionDate)}</td>
+                      <td style={{ ...S.td, whiteSpace:"nowrap" }}>{fmtDate(a.sampleDate)}</td>
+                      <td style={{ ...S.td, padding:"8px" }}>
+                        {a.sampleResult
+                          ? <span style={{ ...rc, borderRadius:4, padding:"2px 8px", fontSize:11, fontWeight:700, whiteSpace:"nowrap" }}>{a.sampleResult}</span>
+                          : <span style={{ color:S.T.textMuted }}>—</span>}
+                      </td>
+                      <td style={S.td}><span style={S.actionBadge(a.status)}>{a.status}</span></td>
+                      <td style={{ ...S.td, maxWidth:240, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={a.agreedAction}>{a.agreedAction||"—"}</td>
+                      <td style={{ ...S.td, color:S.T.textSecondary, whiteSpace:"nowrap" }}>{a.contractor||"—"}</td>
+                      <td style={{ ...S.td, whiteSpace:"nowrap" }}>{fmtDate(a.completedDate)}</td>
+                      <td style={{ ...S.td, whiteSpace:"nowrap" }}>
+                        <button style={{ ...S.btn, padding:"3px 7px", fontSize:11, marginRight:4 }} onClick={(e)=>{e.stopPropagation(); setEditingAction({ idx: globalIdx, action: a });}}>
+                          <i className="ti ti-edit" aria-hidden />
+                        </button>
+                        <button style={{ ...S.btn, padding:"3px 7px", fontSize:11, color:S.T.danger, borderColor:S.T.danger }} onClick={(e)=>{e.stopPropagation(); if(window.confirm("Delete this action?")) onDelete(globalIdx);}}>
+                          <i className="ti ti-trash" aria-hidden />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+      {viewingAction && (
+        <ActionViewCard action={viewingAction} onClose={() => setViewingAction(null)}
+          onEdit={() => { setEditingAction({ idx: actions.indexOf(viewingAction), action: viewingAction }); setViewingAction(null); }} />
+      )}
+
+      {editingAction && (
+        <ActionEditModal
+          action={editingAction.action}
+          onClose={() => setEditingAction(null)}
+          onSave={(updated) => { onUpdate(editingAction.idx, updated); setEditingAction(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Oil Analysis Report ──────────────────────────────────────────────────────
+function MiniLineChart({ datasets, labels, height = 100, yLabel = "" }) {
+  if (!datasets || datasets.length === 0 || !labels || labels.length < 2) return (
+    <div style={{ height, display:"flex", alignItems:"center", justifyContent:"center", color:S.T.textMuted, fontSize:12 }}>No trend data</div>
+  );
+  const allVals = datasets.flatMap(d => d.data.filter(v => v !== null && v !== undefined));
+  if (allVals.length === 0) return null;
+  const minV = Math.min(...allVals), maxV = Math.max(...allVals);
+  const range = maxV - minV || 1;
+  const W = 420, H = height, PL = 40, PR = 12, PT = 10, PB = 30;
+  const cW = W - PL - PR, cH = H - PT - PB;
+  const x = i => PL + (i / (labels.length - 1)) * cW;
+  const y = v => PT + cH - ((v - minV) / range) * cH;
+  const COLORS = [S.T.success,S.T.accent,S.T.danger,S.T.warning,"#9B59B6","#E67E22","#1ABC9C","#E74C3C"];
+  const shortLabel = l => {
+    const d = new Date(l); return isNaN(d) ? l : d.toLocaleDateString("en-GB",{day:"numeric",month:"short"});
+  };
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height }} preserveAspectRatio="xMidYMid meet">
+      {/* grid lines */}
+      {[0,0.25,0.5,0.75,1].map(t => {
+        const yp = PT + cH * (1 - t);
+        const val = minV + range * t;
+        return <g key={t}>
+          <line x1={PL} y1={yp} x2={W-PR} y2={yp} stroke={S.T.border} strokeWidth={0.5} />
+          <text x={PL-4} y={yp+3} textAnchor="end" fontSize={8} fill={S.T.textSecondary}>{val % 1 === 0 ? val : val.toFixed(1)}</text>
+        </g>;
+      })}
+      {/* x labels */}
+      {labels.map((l, i) => (
+        <text key={i} x={x(i)} y={H-4} textAnchor="middle" fontSize={8} fill={S.T.textSecondary}>{shortLabel(l)}</text>
+      ))}
+      {/* datasets */}
+      {datasets.map((ds, di) => {
+        const color = COLORS[di % COLORS.length];
+        const pts = ds.data.map((v, i) => v !== null && v !== undefined ? `${x(i)},${y(v)}` : null).filter(Boolean);
+        const segments = [];
+        let seg = [];
+        ds.data.forEach((v, i) => {
+          if (v !== null && v !== undefined) { seg.push(i); }
+          else { if (seg.length > 1) segments.push([...seg]); seg = []; }
+        });
+        if (seg.length > 1) segments.push(seg);
+        return <g key={di}>
+          {segments.map((seg, si) => (
+            <polyline key={si} points={seg.map(i => `${x(i)},${y(ds.data[i])}`).join(" ")}
+              fill="none" stroke={color} strokeWidth={1.5} />
+          ))}
+          {ds.data.map((v, i) => v !== null && v !== undefined
+            ? <circle key={i} cx={x(i)} cy={y(v)} r={3} fill={color} />
+            : null)}
+        </g>;
+      })}
+    </svg>
+  );
+}
+
+function StatusBadgeCell({ val }) {
+  if (!val) return <td style={{ padding:"6px 8px", border:"1px solid #1E2A3A", fontSize:11, color:S.T.textMuted, textAlign:"center" }}>—</td>;
+  const u = val.toUpperCase();
+  const bg = u==="ALERT"?S.T.danger:u==="CAUTION"?S.T.warning:u==="NORMAL"?S.T.success:u==="WARNING"?S.T.warning:"#444";
+  return (
+    <td style={{ padding:"6px 8px", border:"1px solid #1E2A3A", textAlign:"center" }}>
+      <span style={{ background:bg, color:"#fff", borderRadius:4, padding:"2px 10px", fontSize:11, fontWeight:700, whiteSpace:"nowrap" }}>{val}</span>
+    </td>
+  );
+}
+
+function ValCell({ val, highlight }) {
+  return (
+    <td style={{ padding:"6px 8px", border:"1px solid #1E2A3A", textAlign:"center", fontSize:12,
+      fontFamily:"monospace", fontWeight: highlight ? 700 : 400,
+      color: highlight ? S.T.danger : S.T.textHighlight,
+      background: highlight ? "rgba(230,57,70,0.12)" : "transparent"
+    }}>{val ?? "—"}</td>
+  );
+}
+
+function OilAnalysisReport({ samples, oilChanges, actions, onAddAction, onUpdateAction }) {
+  const [selectedCode, setSelectedCode] = useState("All");
+  const [search, setSearch] = useState("");
+  const [showDropdown, setShowDropdown] = useState(false);
+
+  // Get unique equipment codes that have samples
+  const equipCodes = Array.from(new Set(samples.map(s => s.unitId))).sort();
+
+  // Filtered list for search dropdown
+  const filteredCodes = equipCodes.filter(c => {
+    const reg = EQUIPMENT_REGISTRY.find(r => r.code === c);
+    const desc = reg ? reg.description : "";
+    const q = search.toLowerCase();
+    return c.toLowerCase().includes(q) || desc.toLowerCase().includes(q);
+  });
+
+  function selectCode(c) { setSelectedCode(c); setSearch(""); setShowDropdown(false); }
+
+  // Filter samples for selected equipment, sorted oldest→newest
+  const equipSamples = (selectedCode === "All" ? [] : samples.filter(s => s.unitId === selectedCode))
+    .sort((a, b) => new Date(a.sampledDate) - new Date(b.sampledDate));
+
+  const latest = equipSamples[equipSamples.length - 1];
+  const dates = equipSamples.map(s => s.sampledDate);
+  const regEntry = selectedCode !== "All" ? EQUIPMENT_REGISTRY.find(e => e.code === selectedCode) : null;
+
+  // Last oil change for selected equipment
+  const lastOilChange = (oilChanges || [])
+    .filter(c => c.equipmentCode === selectedCode && c.changeDate)
+    .sort((a,b) => new Date(b.changeDate) - new Date(a.changeDate))[0];
+
+  // Build row data for a metric across all samples
+  const row = (key, sub) => equipSamples.map(s => sub ? (s[sub] || {})[key] : s[key]);
+
+  const wearKeys = ["Ag","Al","Cr","Cu","Fe","Mo","Ni","Pb","Sn"];
+  const wearFull = { Ag:"Silver",Al:"Aluminum",Cr:"Chromium",Cu:"Copper",Fe:"Iron",Mo:"Molybdenum",Ni:"Nickel",Pb:"Lead",Sn:"Tin" };
+  const contKeys = ["K","Na","Si"];
+  const contFull = { K:"Potassium",Na:"Sodium",Si:"Silicon" };
+  const addKeys = ["B","Ba","Ca","Mg","P","Zn"];
+  const addFull = { B:"Boron",Ba:"Barium",Ca:"Calcium",Mg:"Magnesium",P:"Phosphorus",Zn:"Zinc" };
+
+  const thStyle = { padding:"6px 8px", background:S.T.appBg, color:S.T.textSecondary, fontSize:11, fontWeight:700,
+    textAlign:"center", border:`1px solid ${S.T.border}`, whiteSpace:"nowrap" };
+  const rowLabelStyle = { padding:"6px 10px", border:`1px solid ${S.T.border}`, fontSize:12, color:S.T.textSubtle,
+    background:S.T.cardBg, whiteSpace:"nowrap", position:"sticky", left:0, zIndex:2 };
+  const sectionHeaderStyle = { padding:"8px 10px", background:S.T.infoBarBg, color:S.T.accent,
+    fontSize:12, fontWeight:700, border:`1px solid ${S.T.border}`, letterSpacing:0.5 };
+
+  return (
+    <div>
+      <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
+
+      {/* Header bar — searchable dropdown */}
+      <div style={{ background:S.T.cardBg, border:`1px solid ${S.T.border}`, borderRadius:10, padding:"16px 20px", marginBottom:20 }}>
+        <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
+          <div style={{ flex:1, minWidth:280, position:"relative" }}>
+            <p style={{ margin:"0 0 6px", fontSize:12, color:S.T.textSecondary }}>Search or select equipment</p>
+            {/* Search input */}
+            <div style={{ position:"relative" }}>
+              <i className="ti ti-search" style={{ position:"absolute", left:10, top:"50%", transform:"translateY(-50%)", color:S.T.textMuted, fontSize:14, pointerEvents:"none" }} aria-hidden />
+              <input
+                style={{ ...S.input, paddingLeft:32, fontSize:13, minWidth:320 }}
+                value={selectedCode !== "All" && !showDropdown ? `${selectedCode}${regEntry ? " — " + regEntry.description : ""}` : search}
+                placeholder="Type code or description…"
+                onFocus={() => { setShowDropdown(true); setSearch(""); }}
+                onChange={e => { setSearch(e.target.value); setShowDropdown(true); }}
+              />
+              {selectedCode !== "All" && (
+                <button onClick={() => { selectCode("All"); setSearch(""); }}
+                  style={{ position:"absolute", right:8, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", color:S.T.textMuted, cursor:"pointer", fontSize:16 }}>×</button>
+              )}
+            </div>
+            {/* Dropdown */}
+            {showDropdown && (
+              <div style={{ position:"absolute", zIndex:99, top:"100%", left:0, right:0, background:S.T.cardBg,
+                border:`1px solid ${S.T.border}`, borderRadius:8, marginTop:4, maxHeight:260, overflowY:"auto",
+                boxShadow:`0 4px 20px ${S.T.appBg}88` }}>
+                {filteredCodes.length === 0 && (
+                  <div style={{ padding:"12px 14px", color:S.T.textMuted, fontSize:12 }}>No equipment found</div>
+                )}
+                {filteredCodes.map(c => {
+                  const reg = EQUIPMENT_REGISTRY.find(r => r.code === c);
+                  const eqSamples = samples.filter(s => s.unitId === c);
+                  const latestS = eqSamples.sort((a,b) => new Date(b.sampledDate||0)-new Date(a.sampledDate||0))[0];
+                  const statusColor = latestS?.reportStatus === "Alert" ? S.T.danger : latestS?.reportStatus === "Caution" ? S.T.warning : S.T.success;
+                  return (
+                    <div key={c} onClick={() => selectCode(c)}
+                      style={{ padding:"9px 14px", cursor:"pointer", borderBottom:`1px solid ${S.T.border2}`,
+                        background: selectedCode===c ? S.T.navActive : "transparent",
+                        display:"flex", alignItems:"center", justifyContent:"space-between", gap:8 }}
+                      onMouseEnter={e => e.currentTarget.style.background=S.T.infoBarBg}
+                      onMouseLeave={e => e.currentTarget.style.background=selectedCode===c?S.T.navActive:"transparent"}>
+                      <div>
+                        <div style={{ fontSize:12, fontWeight:600, color:S.T.accent }}>{c}</div>
+                        <div style={{ fontSize:11, color:S.T.textSecondary }}>{reg?.description || ""}</div>
+                      </div>
+                      {latestS && (
+                        <span style={{ fontSize:10, fontWeight:700, color:statusColor, background:statusColor+"18", borderRadius:4, padding:"2px 7px", whiteSpace:"nowrap" }}>
+                          {latestS.reportStatus}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {latest && (
+            <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+              <span style={{ fontSize:12, color:S.T.textSecondary }}>Latest:</span>
+              <span style={{ background: latest.reportStatus==="Alert"?S.T.danger:latest.reportStatus==="Caution"?S.T.warning:S.T.success,
+                color:"#fff", borderRadius:4, padding:"4px 14px", fontSize:13, fontWeight:700 }}>{latest.reportStatus}</span>
+              <span style={{ fontSize:12, color:S.T.textSecondary }}>{equipSamples.length} sample{equipSamples.length!==1?"s":""}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Last oil change bar */}
+        {selectedCode !== "All" && (
+          <div style={{ marginTop:12, padding:"10px 14px", background:S.T.infoBarBg, borderRadius:8,
+            border:`1px solid ${lastOilChange ? S.T.success+"44" : S.T.border}`,
+            display:"flex", alignItems:"center", gap:20, flexWrap:"wrap" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <i className="ti ti-oil" style={{ color: lastOilChange ? S.T.success : S.T.textMuted, fontSize:18 }} aria-hidden />
+              <div>
+                <div style={{ fontSize:10, color:S.T.textSecondary }}>Last Oil Change</div>
+                <div style={{ fontSize:13, fontWeight:700, color: lastOilChange ? S.T.success : S.T.danger }}>
+                  {lastOilChange ? fmtDate(lastOilChange.changeDate) : "No record"}
+                </div>
+              </div>
+            </div>
+            {lastOilChange && (<>
+              <div><div style={{ fontSize:10, color:S.T.textSecondary }}>Oil Type</div><div style={{ fontSize:12, color:S.T.textPrimary, fontWeight:500 }}>{lastOilChange.oilType || "—"}</div></div>
+              <div><div style={{ fontSize:10, color:S.T.textSecondary }}>Brand</div><div style={{ fontSize:12, color:S.T.textPrimary, fontWeight:500 }}>{lastOilChange.brand || "—"}</div></div>
+              <div><div style={{ fontSize:10, color:S.T.textSecondary }}>Next Due</div>
+                <div style={{ fontSize:12, fontWeight:600, color: lastOilChange.nextDueDate && new Date(lastOilChange.nextDueDate)<new Date() ? S.T.danger : S.T.textPrimary }}>
+                  {fmtDate(lastOilChange.nextDueDate)}
+                </div>
+              </div>
+              <div><div style={{ fontSize:10, color:S.T.textSecondary }}>Performed By</div><div style={{ fontSize:12, color:S.T.textPrimary }}>{lastOilChange.performedBy || "—"}</div></div>
+            </>)}
+          </div>
+        )}
+      </div>
+
+      {selectedCode === "All" && (
+        <div style={{ textAlign:"center", padding:"60px 20px", color:S.T.textMuted }}>
+          <i className="ti ti-file-analytics" style={{ fontSize:64, display:"block", marginBottom:16 }} aria-hidden />
+          <p style={{ fontSize:16, margin:0 }}>Select an equipment to view its full oil analysis report</p>
+          <p style={{ fontSize:13, marginTop:8, color:S.T.textMuted }}>{equipCodes.length} equipment with samples available</p>
+        </div>
+      )}
+
+      {selectedCode !== "All" && equipSamples.length === 0 && (
+        <div style={{ textAlign:"center", padding:40, color:S.T.textMuted, fontSize:14 }}>No samples found for this equipment.</div>
+      )}
+
+      {selectedCode !== "All" && equipSamples.length > 0 && latest && (
+        <div>
+          {/* ── Report Header (mirrors Mobil layout) ── */}
+          <div style={{ background:S.T.cardBg, border:"1px solid #1E3A5F", borderRadius:10, overflow:"hidden", marginBottom:20 }}>
+            {/* Alert banner */}
+            <div style={{ background: latest.reportStatus==="Alert"?S.T.danger:latest.reportStatus==="Caution"?S.T.warning:S.T.success,
+              padding:"8px 20px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+              <span style={{ fontWeight:800, fontSize:15, color:"#fff", letterSpacing:1 }}>{latest.reportStatus?.toUpperCase()}</span>
+              <span style={{ fontSize:12, color:"rgba(255,255,255,0.8)" }}>Asset ID: {latest.assetId || regEntry?.assetId || "—"}</span>
+            </div>
+            {/* Info grid */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", borderBottom:"1px solid #1E3A5F" }}>
+              {[
+                { title:"Account Information", rows:[
+                  ["ID","208948"],
+                  ["Name","Arabian Cement Company"],
+                  ["Address","Kattameya-Sokhna Road, Suez, EG"],
+                ]},
+                { title:"Sample Information", rows:[
+                  ["Sample ID", latest.sampleId],
+                  ["Service Level", latest.serviceLevel || "Enhanced"],
+                  ["Bottle ID", latest.bottleId || "—"],
+                  ["Tested Lubricant", latest.lubricant],
+                ]},
+                { title:"Equipment Information", rows:[
+                  ["Asset Class", latest.assetClass || regEntry?.assetClass],
+                  ["Manufacturer", latest.manufacturer || regEntry?.manufacturer],
+                  ["Model", latest.model || regEntry?.model || "N/A"],
+                  ["Lubricant", latest.lubricant],
+                ]},
+              ].map(col => (
+                <div key={col.title} style={{ padding:"12px 16px", borderRight:"1px solid #1E3A5F" }}>
+                  <div style={{ fontSize:11, fontWeight:700, color:S.T.accent, marginBottom:8, letterSpacing:0.5 }}>{col.title}</div>
+                  {col.rows.map(([k,v]) => (
+                    <div key={k} style={{ display:"flex", gap:6, marginBottom:4 }}>
+                      <span style={{ fontSize:11, color:S.T.textSecondary, minWidth:90 }}>{k}:</span>
+                      <span style={{ fontSize:11, color:S.T.textHighlight, fontWeight:500 }}>{v||"—"}</span>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+
+            {/* Unit/Description sub-header */}
+            <div style={{ padding:"10px 20px", display:"flex", gap:24, alignItems:"center" }}>
+              <span style={{ fontSize:11, color:S.T.textSecondary }}>Unit ID: <span style={{ fontFamily:"monospace", fontWeight:700, color:S.T.accent, fontSize:13 }}>{latest.unitId}</span></span>
+              <span style={{ fontSize:11, color:S.T.textSecondary }}>Description: <span style={{ color:S.T.textHighlight }}>{latest.description}</span></span>
+              {regEntry && <span style={{ fontSize:11, color:S.T.textSecondary }}>Interval: <span style={{ color:S.T.textHighlight }}>{regEntry.interval}</span></span>}
+            </div>
+          </div>
+
+          {/* ── Sample Data & Trends ── */}
+          <div style={{ background:S.T.cardBg, border:"1px solid #1E3A5F", borderRadius:10, overflow:"hidden", marginBottom:20 }}>
+            <div style={{ padding:"10px 16px", background:S.T.infoBarBg, borderBottom:"1px solid #1E3A5F" }}>
+              <span style={{ fontSize:13, fontWeight:700, color:S.T.textPrimary }}>Sample Data &amp; Trends</span>
+            </div>
+
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:0 }}>
+              {/* Left: data table */}
+              <div style={{ overflowX:"auto", borderRight:"1px solid #1E3A5F" }}>
+                <table style={{ borderCollapse:"collapse", width:"100%", fontSize:12 }}>
+                  <thead>
+                    <tr>
+                      <th style={{ ...thStyle, textAlign:"left", minWidth:140 }}>Parameter</th>
+                      {equipSamples.map((s,i) => (
+                        <th key={i} style={{ ...thStyle, minWidth:90 }}>{fmtDate(s.sampledDate)}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {/* Sample Info section */}
+                    <tr><td colSpan={equipSamples.length+1} style={sectionHeaderStyle}>Sample Info</td></tr>
+                    <tr>
+                      <td style={rowLabelStyle}>Report Status</td>
+                      {equipSamples.map((s,i) => <StatusBadgeCell key={i} val={s.reportStatus} />)}
+                    </tr>
+                    <tr>
+                      <td style={rowLabelStyle}>Sample ID</td>
+                      {equipSamples.map((s,i) => <td key={i} style={{ padding:"5px 8px", border:"1px solid #1E2A3A", fontSize:10, fontFamily:"monospace", color:S.T.textSecondary, textAlign:"center" }}>{s.sampleId||"—"}</td>)}
+                    </tr>
+                    <tr>
+                      <td style={rowLabelStyle}>Sampled</td>
+                      {equipSamples.map((s,i) => <td key={i} style={{ padding:"5px 8px", border:"1px solid #1E2A3A", fontSize:11, textAlign:"center", color:S.T.textHighlight, fontWeight:600 }}>{s.sampledDate||"—"}</td>)}
+                    </tr>
+                    <tr>
+                      <td style={rowLabelStyle}>Reported</td>
+                      {equipSamples.map((s,i) => <td key={i} style={{ padding:"5px 8px", border:"1px solid #1E2A3A", fontSize:11, textAlign:"center", color:S.T.textSubtle }}>{s.reportedDate||"—"}</td>)}
+                    </tr>
+
+                    {/* Lubricant section */}
+                    <tr><td colSpan={equipSamples.length+1} style={sectionHeaderStyle}>Lubricant</td></tr>
+                    <tr><td style={rowLabelStyle}>Contamination Rating</td>{equipSamples.map((s,i)=><StatusBadgeCell key={i} val={s.contaminationRating}/>)}</tr>
+                    <tr><td style={rowLabelStyle}>Equipment Rating</td>{equipSamples.map((s,i)=><StatusBadgeCell key={i} val={s.equipmentRating}/>)}</tr>
+                    <tr><td style={rowLabelStyle}>Lubricant Rating</td>{equipSamples.map((s,i)=><StatusBadgeCell key={i} val={s.lubricantRating}/>)}</tr>
+                    <tr><td style={rowLabelStyle}>ISO Code (4/6/14)</td>{equipSamples.map((s,i)=><ValCell key={i} val={s.isoCode}/>)}</tr>
+                    <tr><td style={rowLabelStyle}>Particle Count &gt;4µm</td>{equipSamples.map((s,i)=><ValCell key={i} val={s.particleCount4um}/>)}</tr>
+                    <tr><td style={rowLabelStyle}>Particle Count &gt;6µm</td>{equipSamples.map((s,i)=><ValCell key={i} val={s.particleCount6um}/>)}</tr>
+                    <tr><td style={rowLabelStyle}>Particle Count &gt;14µm</td>{equipSamples.map((s,i)=><ValCell key={i} val={s.particleCount14um}/>)}</tr>
+                    <tr><td style={rowLabelStyle}>PQ Index</td>{equipSamples.map((s,i)=><ValCell key={i} val={s.pqIndex} highlight={s.pqIndex>15}/>)}</tr>
+                    <tr><td style={rowLabelStyle}>Visc@40°C (cSt)</td>{equipSamples.map((s,i)=><ValCell key={i} val={s.visc40C} highlight={s.visc40C && (s.visc40C < (latest.visc40C*0.9) || s.visc40C > (latest.visc40C*1.1))}/>)}</tr>
+                    <tr><td style={rowLabelStyle}>Oxidation (Ab/cm)</td>{equipSamples.map((s,i)=><ValCell key={i} val={s.oxidation} highlight={s.oxidation>3}/>)}</tr>
+                    {equipSamples.some(s=>s.tan) && <tr><td style={rowLabelStyle}>TAN (mg KOH/g)</td>{equipSamples.map((s,i)=><ValCell key={i} val={s.tan} highlight={s.tan>1.0}/>)}</tr>}
+                    <tr><td style={rowLabelStyle}>Water (Vol%)</td>{equipSamples.map((s,i)=><ValCell key={i} val={s.water} highlight={s.water && parseFloat(s.water)>0.1}/>)}</tr>
+
+                    {/* Wear section */}
+                    <tr><td colSpan={equipSamples.length+1} style={sectionHeaderStyle}>Wear (ppm)</td></tr>
+                    {wearKeys.map(k => (
+                      <tr key={k}>
+                        <td style={rowLabelStyle}>{k} ({wearFull[k]})</td>
+                        {equipSamples.map((s,i) => {
+                          const v = (s.wear||{})[k];
+                          return <ValCell key={i} val={v??0} highlight={k==="Fe"&&v>20||k==="Cu"&&v>10||k==="Cr"&&v>5} />;
+                        })}
+                      </tr>
+                    ))}
+
+                    {/* Contaminants section */}
+                    <tr><td colSpan={equipSamples.length+1} style={sectionHeaderStyle}>Contaminants (ppm)</td></tr>
+                    {contKeys.map(k => (
+                      <tr key={k}>
+                        <td style={rowLabelStyle}>{k} ({contFull[k]})</td>
+                        {equipSamples.map((s,i) => {
+                          const v = (s.contaminants||{})[k];
+                          return <ValCell key={i} val={v??0} highlight={k==="Si"&&v>20} />;
+                        })}
+                      </tr>
+                    ))}
+
+                    {/* Additives section */}
+                    <tr><td colSpan={equipSamples.length+1} style={sectionHeaderStyle}>Additives (ppm)</td></tr>
+                    {addKeys.map(k => (
+                      <tr key={k}>
+                        <td style={rowLabelStyle}>{k} ({addFull[k]})</td>
+                        {equipSamples.map((s,i) => {
+                          const v = (s.additives||{})[k];
+                          return <ValCell key={i} val={v??0} />;
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Right: charts */}
+              <div style={{ padding:"16px", display:"flex", flexDirection:"column", gap:16 }}>
+                {/* Viscosity chart */}
+                <div style={{ background:S.T.appBg, borderRadius:8, padding:"12px 14px" }}>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+                    <span style={{ fontSize:12, fontWeight:700, color:S.T.textPrimary }}>Viscosity</span>
+                    <div style={{ display:"flex", alignItems:"center", gap:4 }}>
+                      <span style={{ width:10, height:2, background:S.T.success, display:"inline-block" }}/>
+                      <span style={{ fontSize:10, color:S.T.textSecondary }}>Visc@40°C (cSt)</span>
+                    </div>
+                  </div>
+                  <MiniLineChart datasets={[{ data: equipSamples.map(s=>s.visc40C), label:"Visc@40C" }]} labels={dates} height={90} />
+                </div>
+
+                {/* Wear chart */}
+                <div style={{ background:S.T.appBg, borderRadius:8, padding:"12px 14px" }}>
+                  <div style={{ fontSize:12, fontWeight:700, color:S.T.textPrimary, marginBottom:6 }}>Wear</div>
+                  <MiniLineChart
+                    datasets={wearKeys.filter(k => equipSamples.some(s=>(s.wear||{})[k]>0)).map((k,i)=>({
+                      data: equipSamples.map(s=>(s.wear||{})[k]??0), label:k
+                    }))}
+                    labels={dates} height={100}
+                  />
+                  <div style={{ display:"flex", flexWrap:"wrap", gap:"4px 12px", marginTop:6 }}>
+                    {[S.T.success,S.T.accent,S.T.danger,S.T.warning,"#9B59B6","#E67E22","#1ABC9C","#E74C3C","#3498DB"].map((c,i) => {
+                      const k = wearKeys[i];
+                      if (!k || !equipSamples.some(s=>(s.wear||{})[k]>0)) return null;
+                      return <span key={k} style={{ display:"flex", alignItems:"center", gap:3, fontSize:9, color:S.T.textSecondary }}>
+                        <span style={{ width:8, height:8, borderRadius:"50%", background:c }}/>
+                        {k} ({wearFull[k]})
+                      </span>;
+                    })}
+                  </div>
+                </div>
+
+                {/* Contaminants chart */}
+                <div style={{ background:S.T.appBg, borderRadius:8, padding:"12px 14px" }}>
+                  <div style={{ fontSize:12, fontWeight:700, color:S.T.textPrimary, marginBottom:6 }}>Contaminants</div>
+                  <MiniLineChart
+                    datasets={contKeys.map((k,i)=>({ data: equipSamples.map(s=>(s.contaminants||{})[k]??0), label:k }))}
+                    labels={dates} height={90}
+                  />
+                  <div style={{ display:"flex", gap:10, marginTop:6 }}>
+                    {[S.T.success,S.T.accent,S.T.danger].map((c,i)=>(
+                      <span key={i} style={{ display:"flex", alignItems:"center", gap:3, fontSize:9, color:S.T.textSecondary }}>
+                        <span style={{ width:8, height:8, borderRadius:"50%", background:c }}/>{contKeys[i]} ({contFull[contKeys[i]]})
+                      </span>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Physical Properties chart */}
+                <div style={{ background:S.T.appBg, borderRadius:8, padding:"12px 14px" }}>
+                  <div style={{ fontSize:12, fontWeight:700, color:S.T.textPrimary, marginBottom:6 }}>Physical Properties</div>
+                  <MiniLineChart
+                    datasets={[
+                      { data: equipSamples.map(s => s.water ? parseFloat(s.water) : 0), label:"Water" },
+                      { data: equipSamples.map(s => s.oxidation ?? 0), label:"Oxidation" },
+                      ...(equipSamples.some(s=>s.tan) ? [{ data: equipSamples.map(s=>s.tan??null), label:"TAN" }] : []),
+                    ]}
+                    labels={dates} height={90}
+                  />
+                  <div style={{ display:"flex", gap:10, marginTop:6, flexWrap:"wrap" }}>
+                    {[[S.T.success,"Water (Vol%)"],[S.T.accent,"Oxidation (Ab/cm)"],[S.T.warning,"TAN (mg KOH/g)"]].map(([c,l])=>(
+                      <span key={l} style={{ display:"flex", alignItems:"center", gap:3, fontSize:9, color:S.T.textSecondary }}>
+                        <span style={{ width:8, height:8, borderRadius:"50%", background:c }}/>{l}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* ── Recommendations ── */}
+          {latest.recommendations?.length > 0 && (
+            <div style={{ background:S.T.cardBg, border:"1px solid #1E3A5F", borderRadius:10, overflow:"hidden", marginBottom:20 }}>
+              <div style={{ padding:"10px 16px", background:S.T.infoBarBg, borderBottom:"1px solid #1E3A5F", display:"flex", alignItems:"center", gap:8 }}>
+                <i className="ti ti-alert-triangle" style={{ color:S.T.danger, fontSize:16 }} aria-hidden />
+                <span style={{ fontSize:13, fontWeight:700, color:S.T.textPrimary }}>Recommendations / Comments</span>
+              </div>
+              <div style={{ padding:"16px 20px" }}>
+                {latest.recommendations.map((r,i) => (
+                  <div key={i} style={{ marginBottom:14, paddingLeft:14, borderLeft:"3px solid #E63946" }}>
+                    <p style={{ margin:0, fontSize:13, color:S.T.textHighlight, lineHeight:1.7 }}>{r}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── Sample Timeline ── */}
+          <div style={{ background:S.T.cardBg, border:"1px solid #1E3A5F", borderRadius:10, overflow:"hidden", marginBottom:20 }}>
+            <div style={{ padding:"10px 16px", background:S.T.infoBarBg, borderBottom:"1px solid #1E3A5F" }}>
+              <span style={{ fontSize:13, fontWeight:700, color:S.T.textPrimary }}>Sample Timeline</span>
+            </div>
+            <div style={{ padding:"16px 20px" }}>
+              {[...equipSamples].reverse().map((s,i) => (
+                <div key={i} style={{ display:"flex", alignItems:"flex-start", gap:14, marginBottom:14, paddingBottom:14,
+                  borderBottom: i < equipSamples.length-1 ? "1px solid #1E3A5F" : "none" }}>
+                  <div style={{ width:10, height:10, borderRadius:"50%", flexShrink:0, marginTop:3,
+                    background: s.reportStatus==="Alert"?S.T.danger:s.reportStatus==="Caution"?S.T.warning:S.T.success }} />
+                  <div>
+                    <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:4 }}>
+                      <span style={{ fontSize:13, fontWeight:700, color:S.T.textHighlight }}>{fmtDate(s.sampledDate)}</span>
+                      <span style={{ background: s.reportStatus==="Alert"?S.T.danger:s.reportStatus==="Caution"?S.T.warning:S.T.success,
+                        color:"#fff", borderRadius:4, padding:"1px 8px", fontSize:11, fontWeight:700 }}>{s.reportStatus}</span>
+                      {s.sampledBy && <span style={{ fontSize:11, color:S.T.textSecondary }}>by {s.sampledBy}</span>}
+                    </div>
+                    <div style={{ display:"flex", gap:16, flexWrap:"wrap" }}>
+                      <span style={{ fontSize:11, color:S.T.textSecondary }}>Sample ID: <span style={{ color:S.T.textSubtle, fontFamily:"monospace" }}>{s.sampleId||"—"}</span></span>
+                      <span style={{ fontSize:11, color:S.T.textSecondary }}>Visc: <span style={{ color:S.T.accent, fontFamily:"monospace", fontWeight:700 }}>{s.visc40C} cSt</span></span>
+                      <span style={{ fontSize:11, color:S.T.textSecondary }}>Fe: <span style={{ color: (s.wear?.Fe||0)>20?S.T.danger:S.T.textHighlight, fontFamily:"monospace" }}>{s.wear?.Fe??0} ppm</span></span>
+                      <span style={{ fontSize:11, color:S.T.textSecondary }}>Si: <span style={{ color: (s.contaminants?.Si||0)>20?S.T.danger:S.T.textHighlight, fontFamily:"monospace" }}>{s.contaminants?.Si??0} ppm</span></span>
+                      <span style={{ fontSize:11, color:S.T.textSecondary }}>Water: <span style={{ color:S.T.textHighlight, fontFamily:"monospace" }}>{s.water}</span></span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <p style={{ fontSize:11, color:S.T.textMuted, textAlign:"center", marginTop:8 }}>
+            Results and comments of this analysis are advisory only. The validity of the data may be impaired by a non-representative sample or incorrect data. © 2016–2024 ExxonMobil.
+          </p>
+        </div>
+      )}
+
+      {/* Last 5 Actions for selected equipment */}
+      {selectedCode !== "All" && (
+        <div style={{ marginTop:16 }}>
+          <ActionsMiniPanel equipmentCode={selectedCode} actions={actions} onAdd={onAddAction} onUpdate={onUpdateAction} title="Last 5 Actions" limit={5} />
+        </div>
+      )}
+    </div>
+  );
+}
+
